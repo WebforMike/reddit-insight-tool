@@ -6,12 +6,11 @@ import re
 import os
 import time
 import pandas as pd
-import plotly.express as px  # REQUIRED for charts
+import plotly.express as px
 
 # --- CONFIG ---
-st.set_page_config(page_title="Deep Reddit Analyst", page_icon="🕵️‍♂️", layout="wide")
+st.set_page_config(page_title="Deep Reddit Crawler", page_icon="🕷️", layout="wide")
 
-# Initialize session state for results
 if "results" not in st.session_state:
     st.session_state.results = None
 
@@ -23,102 +22,115 @@ with st.sidebar:
     
     st.divider()
     st.markdown("### ⚙️ Settings")
-    search_depth = st.slider("Threads to Scan", 5, 20, 10)
-    filter_location = st.text_input("📍 Force Location Filter (Optional)", placeholder="e.g. Florida, Texas")
+    search_depth = st.slider("Threads to Scan (Search Mode)", 3, 15, 7)
 
 # --- CORE LOGIC ---
-def run_deep_analysis(topic, gemini_k, tavily_k, max_threads, loc_filter):
+def run_analysis(mode, input_data, gemini_k, tavily_k):
     log = []
+    all_threads = {}
     
     try:
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
         model = genai.GenerativeModel('gemini-2.5-flash') 
 
-        # 1. SMART SEARCH STRATEGY (Fixed)
-        # We now start with the BROADEST possible search to catch megathreads.
-        queries = [
-            f"site:reddit.com {topic}",  # Query 1: The Base Term (No modifiers)
-            f"site:reddit.com {topic} quote received 2024 2025", # Query 2: Recent Quotes
-            f"site:reddit.com {topic} insurance cost renewal increase" # Query 3: Price hikes
-        ]
-        
-        all_threads = {} 
-        progress_bar = st.progress(0)
-        
-        for i, q in enumerate(queries):
-            log.append(f"🕵️ Scanning Query {i+1}: '{q}'...")
-            try:
-                # include_raw_content=True is critical
-                response = tavily.search(query=q, search_depth="advanced", max_results=7, include_raw_content=True)
-                
-                for item in response.get('results', []):
-                    url = item['url']
-                    content = item.get('raw_content') or item.get('content')
-                    
-                    # Store if valid content exists & avoid duplicates
-                    if url not in all_threads and content and len(content) > 300: 
-                        all_threads[url] = {
-                            "title": item['title'],
-                            "url": url,
-                            "content": content
-                        }
-            except Exception as e:
-                log.append(f"⚠️ Search warning: {e}")
+        # === STEP 1: GATHER CONTENT ===
+        if mode == "Search":
+            # BROAD SEARCH to catch Megathreads
+            queries = [
+                f"site:reddit.com {input_data}",  # The Base Term (Most important)
+                f"site:reddit.com {input_data} price paid",
+                f"site:reddit.com {input_data} quote renewal"
+            ]
             
-            time.sleep(0.5)
-            progress_bar.progress((i + 1) / len(queries))
+            progress_bar = st.progress(0)
+            for i, q in enumerate(queries):
+                log.append(f"🕵️ Search Query {i+1}: '{q}'...")
+                try:
+                    # include_raw_content=True is VITAL
+                    response = tavily.search(query=q, search_depth="advanced", max_results=5, include_raw_content=True)
+                    for item in response.get('results', []):
+                        if item['url'] not in all_threads and item.get('raw_content'):
+                            all_threads[item['url']] = {
+                                "title": item['title'],
+                                "url": item['url'],
+                                "content": item['raw_content']
+                            }
+                except Exception as e:
+                    log.append(f"⚠️ Search failed: {e}")
+                time.sleep(0.5)
+                progress_bar.progress((i + 1) / len(queries))
+
+        elif mode == "Direct URL":
+            # DEEP CRAWLER strategy
+            urls = [u.strip() for u in input_data.split(",")]
+            log.append(f"🕷️ Crawling {len(urls)} specific URLs...")
             
-        unique_threads = list(all_threads.values())[:max_threads]
-        
-        if not unique_threads:
-            return None, log + ["❌ No accessible Reddit threads found."]
+            for url in urls:
+                if "reddit.com" in url:
+                    try:
+                        # 'extract' grabs the FULL page, not just a snippet
+                        response = tavily.extract(urls=[url], include_images=False)
+                        
+                        # Tavily extract result structure handling
+                        extract_results = response.get('results', [])
+                        
+                        if extract_results:
+                            for item in extract_results:
+                                raw_text = item.get('raw_content', '')
+                                if len(raw_text) < 500:
+                                    log.append(f"⚠️ Warning: Extracted text for {url} is very short ({len(raw_text)} chars). Content might be blocked.")
+                                
+                                all_threads[url] = {
+                                    "title": "Direct URL Import",
+                                    "url": url,
+                                    "content": raw_text
+                                }
+                                log.append(f"✅ Successfully crawled: {url} ({len(raw_text)} chars)")
+                        else:
+                             log.append(f"❌ Crawl failed (No data returned): {url}")
+                             
+                    except Exception as e:
+                        log.append(f"❌ Failed to crawl {url}: {e}")
 
-        log.append(f"✅ Found {len(unique_threads)} unique discussions. Extracting Intelligence...")
+        if not all_threads:
+            return None, log + ["❌ No content found. If pasting URLs, ensure they are valid."]
 
-        # 2. DATA PREP
+        # === STEP 2: PREPARE DATA ===
+        log.append(f"✅ Processing {len(all_threads)} threads...")
         combined_text = ""
-        for t in unique_threads:
-            # We explicitly tag the URL so the LLM can reference it
-            combined_text += f"SOURCE_ID: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{t['content'][:15000]}\n{'='*40}\n"
+        for t in all_threads.values():
+            combined_text += f"SOURCE_ID: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{t['content'][:30000]}\n{'='*40}\n"
 
-        # 3. EXTRACTION PROMPT
-        location_instruction = ""
-        if loc_filter:
-            location_instruction = f"IMPORTANT: The user specifically wants data related to '{loc_filter}'. Prioritize rows mentioning '{loc_filter}'."
-
+        # === STEP 3: "MESSY DATA" EXTRACTION ===
+        # The prompt is now permissive ("Quantity over Perfection")
         prompt = f"""
         You are a Data Scraper. Your job is to extract insurance pricing data from Reddit threads.
         
-        {location_instruction}
-        
-        RULES:
-        1. EXTRACT EVERY SINGLE Mention of a price, quote, or renewal hike.
-        2. If the user does not specify a Car Model, put "Unknown Car".
-        3. If the user does not specify a Location, put "Unknown Location".
-        4. IF NO PRICE IS MENTIONED but there is strong sentiment (e.g., "My rates doubled!"), capture it with price_monthly = 0.
-        5. CONVERT all prices to MONTHLY estimates.
-        6. YOU MUST map the 'source_url' to the 'SOURCE_ID' provided in the text.
+        CRITICAL RULES:
+        1. **Quantity over Perfection:** Extract EVERY price mention, even if the user didn't say their car model or location.
+        2. **Partial Data:** If "Car Model" is missing, fill it with "Unknown Model". If "Location" is missing, fill with "Unknown".
+        3. **Context:** Capture the "quote_snippet" so we can see what they said.
+        4. **Source Mapping:** You MUST map the 'source_url' to the 'SOURCE_ID' provided in the text.
         
         RETURN JSON ONLY:
         {{
             "dataset": [
                 {{
-                    "product_name": "Vehicle Model",
+                    "product_name": "Vehicle Model (or 'Unknown')",
                     "brand": "Insurance Company (or 'Unknown')",
                     "price_monthly": 123,
                     "location": "City/State (or 'Unknown')",
                     "quote_snippet": "The exact text where they said it",
                     "source_url": "The exact SOURCE_ID url",
-                    "source_title": "The Title of the thread",
                     "sentiment": "Positive/Negative/Neutral"
                 }}
             ],
-            "market_summary": "3-sentence summary of the market consensus.",
-            "recommendation": "1 actionable tip for the user."
+            "market_summary": "Summary of the market consensus.",
+            "recommendation": "1 actionable tip."
         }}
         
-        RAW TEXT TO MINE:
+        DATA TO MINE:
         {combined_text}
         """
         
@@ -128,33 +140,42 @@ def run_deep_analysis(topic, gemini_k, tavily_k, max_threads, loc_filter):
         try:
             data = json.loads(text_resp)
         except:
-            # Fallback if JSON is malformed
-            return None, log + ["❌ AI extraction failed. Try again."]
+            return None, log + ["❌ AI Response was not valid JSON. Try again."]
             
         return data, log + ["✅ Extraction Complete!"]
 
     except Exception as e:
-        return None, log + [f"❌ Critical Error: {str(e)}"]
-        
+        return None, log + [f"❌ Error: {str(e)}"]
+
 # --- MAIN UI ---
-st.title("🕵️‍♂️ Deep Reddit Analyst")
-st.caption("Extracts pricing, quotes, and sentiment from real user discussions.")
+st.title("🕷️ Deep Reddit Crawler")
+st.markdown("Extract pricing data via **Search** OR **Direct URL** (for maximum accuracy).")
 
-with st.form("search_form"):
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        topic_input = st.text_input("Research Topic", "Hyundai Car Insurance Cost")
-    with c2:
-        submitted = st.form_submit_button("🚀 Run Analysis", type="primary", use_container_width=True)
+# TABS FOR INPUT METHOD
+tab_search, tab_direct = st.tabs(["🔎 Search Mode", "🔗 Direct URL Crawler"])
 
-if submitted and gemini_key and tavily_key:
-    with st.status("🤖 AI Agent Working...", expanded=True) as status:
-        data, logs = run_deep_analysis(topic_input, gemini_key, tavily_key, search_depth, filter_location)
+with tab_search:
+    with st.form("search_form"):
+        topic_input = st.text_input("Enter Topic", "Hyundai Car Insurance")
+        submit_search = st.form_submit_button("🚀 Run Search Analysis")
+
+with tab_direct:
+    with st.form("direct_form"):
+        url_input = st.text_area("Paste Reddit URLs (comma separated)", "https://www.reddit.com/r/Hyundai/comments/1l1mxlz/insurance_cost/")
+        submit_direct = st.form_submit_button("🕷️ Run Crawler Analysis")
+
+# EXECUTION LOGIC
+if (submit_search or submit_direct) and gemini_key and tavily_key:
+    mode = "Search" if submit_search else "Direct URL"
+    input_data = topic_input if submit_search else url_input
+    
+    with st.status(f"🤖 Running {mode} Analysis...", expanded=True) as status:
+        data, logs = run_analysis(mode, input_data, gemini_key, tavily_key)
         for l in logs: st.write(l)
         
         if data:
             st.session_state.results = data
-            status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
+            status.update(label="✅ Done!", state="complete", expanded=False)
 
 # --- RESULTS DISPLAY ---
 if st.session_state.results:
@@ -163,106 +184,44 @@ if st.session_state.results:
     if "dataset" in data and data["dataset"]:
         df = pd.DataFrame(data["dataset"])
         
-        # 1. CLEANING
-        # Convert price to numeric, force 0 for non-numbers
+        # CLEANING: Handle messy data
         df['price_monthly'] = pd.to_numeric(df['price_monthly'], errors='coerce').fillna(0)
-        
-        # Filter by Location if requested
-        if filter_location:
-            # Simple string match, case insensitive
-            df = df[df['location'].str.contains(filter_location, case=False, na=False) | 
-                    df['quote_snippet'].str.contains(filter_location, case=False, na=False)]
-            if df.empty:
-                st.warning(f"No specific data points found for '{filter_location}', showing all results instead.")
-                df = pd.DataFrame(data["dataset"]) # Revert
-                df['price_monthly'] = pd.to_numeric(df['price_monthly'], errors='coerce').fillna(0)
-
-        # Fill text NaNs
-        for col in ['brand', 'product_name', 'location', 'quote_snippet', 'source_url']:
-            if col not in df.columns: df[col] = "Unknown"
+        df.fillna("Unknown", inplace=True)
 
         st.divider()
-        st.header(f"Results for: {topic_input}")
+        st.header("📊 Extraction Results")
 
-        # TABS
-        tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "📝 Raw Data", "🧠 Insights"])
+        t1, t2, t3, t4 = st.tabs(["Dashboard", "Raw Data", "Insights", "🕷️ Debug: Raw Text"])
 
-        # === TAB 1: DASHBOARD ===
-        with tab1:
-            # Filter out 0 prices for stats (since 0 = sentiment only)
-            valid_prices = df[df['price_monthly'] > 0]
-            
+        with t1:
+            valid = df[df['price_monthly'] > 0]
             k1, k2, k3 = st.columns(3)
-            k1.metric("Mentions Found", len(df))
-            if not valid_prices.empty:
-                k2.metric("Median Price", f"${int(valid_prices['price_monthly'].median())}/mo")
-                k3.metric("Max Price", f"${int(valid_prices['price_monthly'].max())}/mo")
-            else:
-                k2.metric("Median Price", "N/A")
-                k3.metric("Max Price", "N/A")
+            k1.metric("Data Points", len(df))
+            if not valid.empty:
+                k2.metric("Median Price", f"${int(valid['price_monthly'].median())}")
+                k3.metric("Max Price", f"${int(valid['price_monthly'].max())}")
             
-            st.divider()
-            
-            c1, c2 = st.columns(2)
-            
-            with c1:
-                st.subheader("💰 Price by Brand")
-                if not valid_prices.empty:
-                    # Clean up brand names (simple logic)
-                    valid_prices['brand'] = valid_prices['brand'].str.title()
-                    
-                    fig_bar = px.bar(
-                        valid_prices.groupby("brand")['price_monthly'].mean().reset_index(), 
-                        x='price_monthly', 
-                        y='brand', 
-                        orientation='h', 
-                        title="Avg Monthly Cost ($)",
-                        color='price_monthly',
-                        color_continuous_scale='Bluered'
-                    )
-                    st.plotly_chart(fig_bar, use_container_width=True)
-                else:
-                    st.info("No numerical price data to chart.")
+            if not valid.empty:
+                st.subheader("💰 Price Distribution by Brand")
+                fig = px.scatter(valid, x="brand", y="price_monthly", color="sentiment", size="price_monthly", hover_data=["product_name", "location"])
+                st.plotly_chart(fig, use_container_width=True)
 
-            with c2:
-                st.subheader("📈 Sentiment Split")
-                if 'sentiment' in df.columns:
-                    fig_pie = px.pie(df, names='sentiment', title='User Sentiment', color_discrete_sequence=px.colors.sequential.RdBu)
-                    st.plotly_chart(fig_pie, use_container_width=True)
-
-        # === TAB 2: RAW DATA ===
-        with tab2:
-            st.markdown("### 🔍 Granular Data Explorer")
-            
-            # Download
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download CSV", data=csv, file_name="reddit_data.csv", mime="text/csv")
-            
-            # Table
+        with t2:
+            st.markdown("### 🔍 Granular Data")
             st.dataframe(
                 df[['brand', 'price_monthly', 'product_name', 'location', 'quote_snippet', 'source_url']],
                 use_container_width=True,
-                column_config={
-                    "price_monthly": st.column_config.NumberColumn("Price ($)", format="$%d"),
-                    "source_url": st.column_config.LinkColumn("Source", display_text="🔗 View Thread"),
-                    "quote_snippet": st.column_config.TextColumn("Evidence", width="medium"),
-                }
+                column_config={"source_url": st.column_config.LinkColumn("Source")}
             )
 
-        # === TAB 3: INSIGHTS ===
-        with tab3:
-            st.subheader("Market Summary")
-            st.info(data.get("market_summary", "No summary available."))
-            
-            st.subheader("Recommendation")
-            st.success(data.get("recommendation", "No specific recommendation."))
-            
-            st.divider()
-            st.subheader("🗣️ Notable Quotes")
-            for index, row in df.head(5).iterrows():
-                st.markdown(f"> *\"{row['quote_snippet']}\"*")
-                st.caption(f"Details: {row['brand']} | {row['location']} | [Source]({row['source_url']})")
-                st.write("---")
+        with t3:
+            st.info(data.get("market_summary"))
+            st.success(data.get("recommendation"))
 
+        # --- NEW DEBUG TAB ---
+        with t4:
+            st.markdown("### 🕵️‍♂️ Audit: What did the AI actually read?")
+            st.warning("This is the raw text extracted from the URL. If this is empty or short, the scraping failed.")
+            st.text_area("Raw Extracted Content", value=str(st.session_state.results).get('raw_debug', 'Raw text not saved to session state (check logs)'), height=400)
     else:
         st.warning("⚠️ Analysis ran, but no specific data points could be extracted.")
