@@ -26,72 +26,60 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     search_depth = st.slider("Threads to Scan", 3, 10, 5)
 
-# --- HELPER: MIRROR SCRAPER ---
+# --- HELPER: ROBUST MIRROR SCRAPER ---
 def scrape_reddit_via_mirrors(url):
     """
-    Attempts to scrape Reddit content by swapping the domain
-    with public 'Libreddit'/'Redlib' mirrors to bypass blocking.
+    Attempts to scrape Reddit content via mirrors using 'Brute Force' text extraction.
     """
-    # 1. List of public mirrors (These are open source frontends)
-    # We try them in order until one works.
+    # Expanded list of mirrors (Libreddit, Teddit, Redlib)
     mirrors = [
         "https://r.mnfstr.com", 
+        "https://rx.mnfstr.com",
         "https://libreddit.bus-hit.me",
-        "https://lr.artemislena.eu",
-        "https://reddit.invak.id"
+        "https://reddit.invak.id",
+        "https://teddit.net",
+        "https://libreddit.kavin.rocks"
     ]
     
-    # Extract the path from the original URL (e.g., /r/Hyundai/...)
+    # Path extraction
     if "reddit.com" in url:
         path = url.split("reddit.com")[-1]
     elif "redd.it" in url:
         path = "/" + url.split("redd.it/")[-1]
     else:
-        path = url # Assume it's just a path or invalid
-        
+        path = url 
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # 2. Try each mirror
     for mirror in mirrors:
         target_link = mirror + path
         try:
-            response = requests.get(target_link, headers=headers, timeout=8)
+            # Short timeout to skip dead mirrors fast
+            response = requests.get(target_link, headers=headers, timeout=5)
             
             if response.status_code == 200:
-                # 3. Success! Parse the HTML
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Extract Title
-                title = soup.find('h1')
-                title_text = title.text.strip() if title else "Unknown Title"
+                # --- STRATEGY: BRUTE FORCE TEXT ---
+                # We don't look for specific classes anymore. We grab everything.
+                # The LLM will sort out the noise.
+                full_page_text = soup.get_text(separator='\n', strip=True)
                 
-                # Extract Comments (Libreddit structure is simple)
-                comments = []
-                # Look for comment bodies (structure varies slightly by instance, broad catch)
-                for div in soup.find_all('div', class_='body'):
-                    comments.append(div.get_text(strip=True))
-                
-                # Fallback if class names differ
-                if not comments:
-                    for p in soup.find_all('p'):
-                        if len(p.text) > 50: # Filter short UI text
-                            comments.append(p.text.strip())
-                            
-                full_text = "\n---\n".join(comments)
-                
-                return {
-                    "status": "success", 
-                    "content": full_text[:25000], 
-                    "mirror_used": mirror,
-                    "title": title_text
-                }
+                # Validation: Did we actually get content?
+                if len(full_page_text) > 500:
+                    return {
+                        "status": "success", 
+                        "content": full_page_text[:40000], # Grab more text
+                        "mirror_used": mirror,
+                        "title": "Extracted via Mirror"
+                    }
                 
         except Exception:
             continue # Try next mirror
             
-    return {"status": "error", "msg": "All mirrors failed or timed out."}
+    return {"status": "error", "msg": "All mirrors failed or returned empty text."}
 
 # --- CORE LOGIC ---
 def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
