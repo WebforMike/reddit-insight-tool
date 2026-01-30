@@ -7,9 +7,11 @@ import os
 import time
 import pandas as pd
 import plotly.express as px
+import requests
+from bs4 import BeautifulSoup
 
 # --- CONFIG ---
-st.set_page_config(page_title="Deep Reddit Crawler", page_icon="🕷️", layout="wide")
+st.set_page_config(page_title="Deep Reddit Analyst (Mirror Mode)", page_icon="🪞", layout="wide")
 
 if "results" not in st.session_state:
     st.session_state.results = None
@@ -24,10 +26,77 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     search_depth = st.slider("Threads to Scan", 3, 10, 5)
 
+# --- HELPER: MIRROR SCRAPER ---
+def scrape_reddit_via_mirrors(url):
+    """
+    Attempts to scrape Reddit content by swapping the domain
+    with public 'Libreddit'/'Redlib' mirrors to bypass blocking.
+    """
+    # 1. List of public mirrors (These are open source frontends)
+    # We try them in order until one works.
+    mirrors = [
+        "https://r.mnfstr.com", 
+        "https://libreddit.bus-hit.me",
+        "https://lr.artemislena.eu",
+        "https://reddit.invak.id"
+    ]
+    
+    # Extract the path from the original URL (e.g., /r/Hyundai/...)
+    if "reddit.com" in url:
+        path = url.split("reddit.com")[-1]
+    elif "redd.it" in url:
+        path = "/" + url.split("redd.it/")[-1]
+    else:
+        path = url # Assume it's just a path or invalid
+        
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    # 2. Try each mirror
+    for mirror in mirrors:
+        target_link = mirror + path
+        try:
+            response = requests.get(target_link, headers=headers, timeout=8)
+            
+            if response.status_code == 200:
+                # 3. Success! Parse the HTML
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Extract Title
+                title = soup.find('h1')
+                title_text = title.text.strip() if title else "Unknown Title"
+                
+                # Extract Comments (Libreddit structure is simple)
+                comments = []
+                # Look for comment bodies (structure varies slightly by instance, broad catch)
+                for div in soup.find_all('div', class_='body'):
+                    comments.append(div.get_text(strip=True))
+                
+                # Fallback if class names differ
+                if not comments:
+                    for p in soup.find_all('p'):
+                        if len(p.text) > 50: # Filter short UI text
+                            comments.append(p.text.strip())
+                            
+                full_text = "\n---\n".join(comments)
+                
+                return {
+                    "status": "success", 
+                    "content": full_text[:25000], 
+                    "mirror_used": mirror,
+                    "title": title_text
+                }
+                
+        except Exception:
+            continue # Try next mirror
+            
+    return {"status": "error", "msg": "All mirrors failed or timed out."}
+
 # --- CORE LOGIC ---
 def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
     log = []
-    final_content_map = {} # Url -> Content
+    final_content_map = {} 
     
     try:
         tavily = TavilyClient(api_key=tavily_k)
@@ -35,14 +104,12 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
         model = genai.GenerativeModel('gemini-2.5-flash') 
 
         # ==========================================
-        # PHASE 1: INTELLIGENT GATHERING
+        # PHASE 1: GATHERING URLS
         # ==========================================
         target_urls = []
         
         if mode == "Search":
-            # BROAD DISCOVERY
             queries = [
-                f"site:reddit.com {input_data}", 
                 f"site:reddit.com {input_data} price paid",
                 f"site:reddit.com {input_data} quote received"
             ]
@@ -50,106 +117,84 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
             progress_bar = st.progress(0)
             
             for i, q in enumerate(queries):
-                log.append(f"🕵️ Scout Query {i+1}: '{q}'...")
+                log.append(f"🕵️ Scout Query {i+1}...")
                 try:
-                    # We grab raw content immediately here as a backup
-                    response = tavily.search(query=q, search_depth="advanced", max_results=5, include_raw_content=True)
-                    
-                    for item in response.get('results', []):
-                        url = item['url']
-                        content = item.get('raw_content', '')
-                        
-                        if url not in final_content_map and len(content) > 500:
-                            final_content_map[url] = {
-                                "title": item['title'],
-                                "url": url,
-                                "content": content
-                            }
+                    response = tavily.search(query=q, search_depth="basic", max_results=5)
+                    # FIX: Handle NoneType if API fails
+                    if response and 'results' in response:
+                        for item in response['results']:
+                            if "reddit.com" in item['url'] and item['url'] not in target_urls:
+                                target_urls.append(item['url'])
+                    else:
+                        log.append(f"⚠️ Query {i+1} returned no data.")
                             
                 except Exception as e:
-                    log.append(f"⚠️ Search error: {e}")
+                    log.append(f"⚠️ Search failed: {e}")
                 
                 time.sleep(0.3)
                 progress_bar.progress((i + 1) / len(queries))
+            
+            # Use top X urls
+            target_urls = target_urls[:depth]
 
         elif mode == "Direct URL":
-            # HYBRID CRAWL STRATEGY
-            urls = [u.strip() for u in input_data.split(",") if "reddit.com" in u]
-            log.append(f"🕷️ Attempting to crawl {len(urls)} links...")
+            target_urls = [u.strip() for u in input_data.split(",") if "reddit.com" in u]
+
+        if not target_urls:
+            return None, log + ["❌ No Reddit URLs found."]
+
+        # ==========================================
+        # PHASE 2: MIRROR SCRAPING
+        # ==========================================
+        log.append(f"🪞 Mirroring {len(target_urls)} threads (Bypassing Reddit.com)...")
+        
+        for url in target_urls:
+            res = scrape_reddit_via_mirrors(url)
             
-            for url in urls:
-                # STRATEGY A: Direct Extraction (Best quality, but risky)
-                crawled_content = ""
-                try:
-                    response = tavily.extract(urls=[url], include_images=False)
-                    raw_res = response.get('results', [])[0]
-                    crawled_content = raw_res.get('raw_content', '')
-                except:
-                    pass
-
-                # CHECK: Did we get blocked?
-                if len(crawled_content) < 600 or "Whoops" in crawled_content:
-                    log.append(f"⚠️ Direct crawl blocked for {url}. Switching to Cache Search...")
-                    
-                    # STRATEGY B: Search Cache Bypass (Reliable)
-                    try:
-                        # Search specifically for this URL to find the cached snippet
-                        search_res = tavily.search(query=url, search_depth="advanced", max_results=1, include_raw_content=True)
-                        if search_res.get('results'):
-                            crawled_content = search_res['results'][0].get('raw_content', '')
-                            log.append(f"✅ Recovered content via Cache ({len(crawled_content)} chars)")
-                        else:
-                             log.append(f"❌ Cache failed for {url}")
-                    except Exception as e:
-                        log.append(f"❌ Recovery failed: {e}")
-                else:
-                    log.append(f"✅ Direct crawl success ({len(crawled_content)} chars)")
-
-                if len(crawled_content) > 300:
-                    final_content_map[url] = {
-                        "title": "Direct Import",
-                        "url": url,
-                        "content": crawled_content
-                    }
+            if res['status'] == 'success':
+                final_content_map[url] = res
+                log.append(f"✅ Recovered via {res['mirror_used']} ({len(res['content'])} chars)")
+            else:
+                log.append(f"❌ Failed to mirror {url}")
+            
+            time.sleep(0.5) # Politeness
 
         if not final_content_map:
-            return None, log + ["❌ No accessible text found. Reddit likely blocked all attempts."]
+            return None, log + ["❌ All mirrors failed. Reddit is blocking heavily today."]
 
         # ==========================================
-        # PHASE 2: "MESSY DATA" EXTRACTION
+        # PHASE 3: AI EXTRACTION
         # ==========================================
-        log.append(f"🧠 Analyzing {len(final_content_map)} threads with Gemini 2.0...")
+        log.append(f"🧠 Analyzing extracted text...")
         
         combined_text = ""
         for url, data in final_content_map.items():
-            combined_text += f"SOURCE_ID: {url}\nCONTENT:\n{data['content'][:25000]}\n{'='*40}\n"
+            combined_text += f"SOURCE_ID: {url}\nTITLE: {data['title']}\nTEXT:\n{data['content']}\n{'='*40}\n"
 
         prompt = f"""
-        You are an Expert Data Actuary.
+        You are an Expert Data Actuary. Extract insurance pricing data.
         
-        GOAL: Extract insurance pricing data from this raw Reddit text.
+        RULES:
+        1. **Extract Everything:** Any user mentioning a price/quote/hike.
+        2. **Implicit Data:** If user says "$100" but no car model, use "Unknown Model".
+        3. **Context:** Copy the exact text into 'quote_snippet'.
+        4. **Source:** Map data to 'SOURCE_ID'.
         
-        STRICT RULES:
-        1. **Extract Everything:** If a user mentions a price, I want it. 
-        2. **Messy Data is OK:** If they say "$100" but don't say the car, record it as "Unknown Car".
-        3. **Context:** Capture the exact quote in "quote_snippet".
-        4. **Source:** Map the data back to the 'SOURCE_ID' (URL).
-        
-        RETURN JSON ONLY:
+        RETURN JSON:
         {{
             "dataset": [
                 {{
-                    "product_name": "Vehicle Model (or 'Unknown')",
-                    "brand": "Insurance Company (or 'Unknown')",
+                    "product_name": "Vehicle Model",
+                    "brand": "Insurance Company",
                     "price_monthly": 123,
-                    "location": "City/State (or 'Unknown')",
-                    "quote_snippet": "The text proving the price",
-                    "source_url": "The SOURCE_ID",
+                    "location": "City/State",
+                    "quote_snippet": "exact quote",
+                    "source_url": "SOURCE_ID",
                     "sentiment": "Positive/Negative/Neutral"
                 }}
             ],
-            "market_summary": "Brief summary.",
-            "recommendation": "One tip."
+            "market_summary": "Summary.",
+            "recommendation": "Tip."
         }}
         
         DATA:
@@ -159,13 +204,9 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
         response = model.generate_content(prompt)
         text_resp = response.text.replace("```json", "").replace("```", "").strip()
         
-        # Save raw debug text for the user to see
-        raw_debug_text = combined_text
-        
         try:
             data = json.loads(text_resp)
-            # Attach debug text to data object for UI
-            data['raw_debug'] = raw_debug_text 
+            data['raw_debug'] = combined_text 
         except:
             return None, log + ["❌ AI output was not valid JSON."]
             
@@ -175,9 +216,10 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
         return None, log + [f"❌ Critical Pipeline Error: {str(e)}"]
 
 # --- MAIN UI ---
-st.title("🕷️ Deep Reddit Crawler (Anti-Block)")
+st.title("🪞 Deep Reddit Analyst (Mirror Mode)")
+st.markdown("Bypasses Reddit blocking by routing requests through public 'Libreddit' mirrors.")
 
-tab_search, tab_direct = st.tabs(["🔎 Auto-Search", "🔗 Direct Link"])
+tab_search, tab_direct = st.tabs(["🔎 Search Mode", "🔗 Direct URL Mode"])
 
 with tab_search:
     with st.form("search_form"):
@@ -187,9 +229,9 @@ with tab_search:
 with tab_direct:
     with st.form("direct_form"):
         url_input = st.text_area("Paste Reddit URLs", "https://www.reddit.com/r/Hyundai/comments/1l1mxlz/insurance_cost/")
-        submit_direct = st.form_submit_button("🕷️ Run Direct Crawl")
+        submit_direct = st.form_submit_button("🪞 Run Mirror Scrape")
 
-if (submit_search or submit_direct) and gemini_key and tavily_key:
+if (submit_search or submit_direct) and gemini_key:
     mode = "Search" if submit_search else "Direct URL"
     input_data = topic_input if submit_search else url_input
     
@@ -212,7 +254,7 @@ if st.session_state.results:
         st.divider()
         st.header("📊 Extraction Results")
         
-        t1, t2, t3, t4 = st.tabs(["Dashboard", "Raw Data Table", "Insights", "🕷️ Debug View"])
+        t1, t2, t3, t4 = st.tabs(["Dashboard", "Raw Data", "Insights", "🕷️ Debug Text"])
         
         with t1:
             valid = df[df['price_monthly'] > 0]
@@ -224,7 +266,7 @@ if st.session_state.results:
                 st.plotly_chart(px.bar(valid, x='price_monthly', y='brand', orientation='h', color='price_monthly'), use_container_width=True)
             else:
                 k2.metric("Median Price", "N/A")
-                st.warning("Prices mentioned were not numeric or only sentiment was found.")
+                st.warning("No numeric prices found.")
 
         with t2:
             st.dataframe(
@@ -237,11 +279,8 @@ if st.session_state.results:
              st.info(data.get("market_summary"))
              st.success(data.get("recommendation"))
 
-        # --- DEBUG TAB ---
         with t4:
-            st.markdown("### 🕵️‍♂️ Audit: What did the AI actually read?")
-            st.warning("This is the raw text extracted. If this is 'Whoops' or empty, Reddit blocked the crawler.")
-            st.text_area("Raw Content", value=data.get('raw_debug', 'No debug info'), height=400)
+            st.text_area("Raw Content Read by AI", value=data.get('raw_debug', 'No debug info'), height=400)
 
     else:
-        st.warning("Pipeline finished, but AI found no price data in the text.")
+        st.warning("Pipeline finished, but AI found no price data.")
