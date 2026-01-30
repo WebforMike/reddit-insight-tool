@@ -1,3 +1,4 @@
-﻿streamlit
-praw
+streamlit
 google-generativeai
+duckduckgo-search
+requests
