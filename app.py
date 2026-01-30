@@ -31,7 +31,7 @@ def run_deep_analysis(topic, gemini_k, tavily_k, max_threads):
     try:
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
-        model = genai.GenerativeModel('gemini-2.0-flash') 
+        model = genai.GenerativeModel('gemini-2.5-flash') 
 
         # 1. AGGRESSIVE SEARCH
         queries = [
