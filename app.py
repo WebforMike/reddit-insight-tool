@@ -33,14 +33,14 @@ def run_deep_analysis(topic, gemini_k, tavily_k, max_threads, loc_filter):
     try:
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
-        model = genai.GenerativeModel('gemini-2.5-flash') 
+        model = genai.GenerativeModel('gemini-2.0-flash') 
 
-        # 1. BROAD SEARCH (Finding the threads)
-        # We use simpler queries to cast a wider net
+        # 1. SMART SEARCH STRATEGY (Fixed)
+        # We now start with the BROADEST possible search to catch megathreads.
         queries = [
-            f"site:reddit.com {topic} cost price paid",
-            f"site:reddit.com {topic} insurance quote renewal",
-            f"site:reddit.com {topic} expensive cheap review"
+            f"site:reddit.com {topic}",  # Query 1: The Base Term (No modifiers)
+            f"site:reddit.com {topic} quote received 2024 2025", # Query 2: Recent Quotes
+            f"site:reddit.com {topic} insurance cost renewal increase" # Query 3: Price hikes
         ]
         
         all_threads = {} 
@@ -56,8 +56,8 @@ def run_deep_analysis(topic, gemini_k, tavily_k, max_threads, loc_filter):
                     url = item['url']
                     content = item.get('raw_content') or item.get('content')
                     
-                    # Store if valid content exists
-                    if content and len(content) > 300: 
+                    # Store if valid content exists & avoid duplicates
+                    if url not in all_threads and content and len(content) > 300: 
                         all_threads[url] = {
                             "title": item['title'],
                             "url": url,
@@ -83,7 +83,6 @@ def run_deep_analysis(topic, gemini_k, tavily_k, max_threads, loc_filter):
             combined_text += f"SOURCE_ID: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{t['content'][:15000]}\n{'='*40}\n"
 
         # 3. EXTRACTION PROMPT
-        # We force the model to be a "Database Extractor" not a summarizer
         location_instruction = ""
         if loc_filter:
             location_instruction = f"IMPORTANT: The user specifically wants data related to '{loc_filter}'. Prioritize rows mentioning '{loc_filter}'."
@@ -136,7 +135,7 @@ def run_deep_analysis(topic, gemini_k, tavily_k, max_threads, loc_filter):
 
     except Exception as e:
         return None, log + [f"❌ Critical Error: {str(e)}"]
-
+        
 # --- MAIN UI ---
 st.title("🕵️‍♂️ Deep Reddit Analyst")
 st.caption("Extracts pricing, quotes, and sentiment from real user discussions.")
