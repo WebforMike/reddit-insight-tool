@@ -1,5 +1,7 @@
 streamlit
-plotly
-pandas
 google-generativeai
 tavily-python
+pandas
+plotly
+requests
+beautifulsoup4
