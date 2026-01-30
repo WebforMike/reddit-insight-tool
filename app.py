@@ -44,7 +44,7 @@ if st.button("🚀 Find & Analyze Threads", type="primary"):
     try:
         tavily = TavilyClient(api_key=tavily_key)
         genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.0-flash')
     except Exception as e:
         st.error(f"Error connecting to APIs: {e}")
         st.stop()
