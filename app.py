@@ -37,7 +37,7 @@ def run_analysis_cached(topic, gemini_k, tavily_k):
     try:
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
 
         # 1. SEARCH WITH RAW CONTENT (The Fix)
         # We assume Reddit will block any direct visit, so we ask Tavily 
