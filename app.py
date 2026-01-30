@@ -5,10 +5,11 @@ import json
 import re
 import os
 import time
-import pandas as pd # New: For real data analysis
+import pandas as pd
+import plotly.express as px  # <--- THIS WAS MISSING CAUSING THE ERROR
 
 # --- CONFIG ---
-st.set_page_config(page_title="Deep Reddit Analyst", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Deep Reddit Market Analyst", page_icon="🕵️‍♂️", layout="wide")
 
 if "results" not in st.session_state:
     st.session_state.results = None
@@ -18,261 +19,209 @@ with st.sidebar:
     st.header("🔑 API Keys")
     gemini_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or st.text_input("Gemini Key", type="password")
     tavily_key = st.secrets.get("TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY") or st.text_input("Tavily Key", type="password")
+    
+    st.divider()
+    st.markdown("### ⚙️ Search Settings")
+    search_depth = st.slider("Threads to Analyze", min_value=5, max_value=20, value=10)
 
 # --- LOGIC ---
-def run_deep_analysis(topic, gemini_k, tavily_k):
+def run_deep_analysis(topic, gemini_k, tavily_k, max_threads):
     log = []
     
     try:
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
-        # Using Gemini 1.5 Pro or 2.0 Flash because we need a HUGE context window for this
-        model = genai.GenerativeModel('gemini-2.5-flash') 
+        model = genai.GenerativeModel('gemini-2.0-flash') 
 
-        # 1. MULTI-QUERY EXPANSION (The "Quantity" Fix)
-        # We generate 3 variations of the search to find MORE threads.
+        # 1. AGGRESSIVE SEARCH
         queries = [
-            f"site:reddit.com {topic} price cost",
-            f"site:reddit.com {topic} quote received",
-            f"site:reddit.com {topic} review expensive cheap"
+            f"site:reddit.com {topic} price paid 2024 2025",
+            f"site:reddit.com {topic} quote received renewal",
+            f"site:reddit.com {topic} cost per month"
         ]
         
-        all_threads = {} # Use dict to remove duplicates by URL
-        
+        all_threads = {} 
         progress_bar = st.progress(0)
         
         for i, q in enumerate(queries):
             log.append(f"🕵️ Running Query {i+1}: '{q}'...")
+            try:
+                # include_raw_content=True is critical for reading the whole thread
+                response = tavily.search(query=q, search_depth="advanced", max_results=7, include_raw_content=True)
+                
+                for item in response.get('results', []):
+                    url = item['url']
+                    # Prefer raw_content (full text), fall back to content (snippet)
+                    content = item.get('raw_content') or item.get('content')
+                    
+                    if content and len(content) > 300: # Filter out short junk
+                        all_threads[url] = {
+                            "title": item['title'],
+                            "url": url,
+                            "content": content
+                        }
+            except Exception as e:
+                log.append(f"⚠️ Search error: {e}")
             
-            # Use 'raw_content' to bypass blocking
-            response = tavily.search(query=q, search_depth="advanced", max_results=7, include_raw_content=True)
-            
-            for item in response.get('results', []):
-                # Only keep if it has decent text content
-                content = item.get('raw_content') or item.get('content')
-                if content and len(content) > 150:
-                    all_threads[item['url']] = {
-                        "title": item['title'],
-                        "url": item['url'],
-                        "content": content
-                    }
-            
-            time.sleep(0.5) # Be polite
+            time.sleep(0.5)
             progress_bar.progress((i + 1) / len(queries))
             
-        unique_threads = list(all_threads.values())
+        unique_threads = list(all_threads.values())[:max_threads]
         
-        if len(unique_threads) < 2:
-            return None, log + ["❌ Not enough data found."]
+        if len(unique_threads) < 1:
+            return None, log + ["❌ No valid data found. Try a different topic."]
             
-        log.append(f"✅ Aggregated {len(unique_threads)} unique threads. Analyzing...")
+        log.append(f"✅ Found {len(unique_threads)} unique threads. Extracting data...")
 
-        # 2. BULK CONTEXT PREPARATION
-        # We combine ALL 15-20 threads into one massive prompt
+        # 2. DATA PREP
         combined_text = ""
         for t in unique_threads:
-            combined_text += f"SOURCE: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{t['content'][:8000]}\n{'='*40}\n"
+            # tag each section so the AI knows where the info came from
+            combined_text += f"SOURCE_ID: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{t['content'][:12000]}\n{'='*40}\n"
 
-        # 3. ADVANCED "DATA VACUUM" PROMPT
+        # 3. RELAXED EXTRACTION PROMPT (Fixes "Only 2 datapoints" issue)
         prompt = f"""
-        You are an Expert Data Extraction Agent. I have scraped Reddit discussions about "{topic}".
+        You are a Data Scraper. Extract pricing data from this Reddit text.
         
-        Your Goal: specific, tabular data extraction. Do NOT summarize yet.
+        CRITICAL RULES:
+        1. EXTRACT EVERY SINGLE price mention. Do not be picky. 
+        2. If the user doesn't say their car, list it as "Unknown Vehicle".
+        3. If the user doesn't say their location, list "Unknown Location".
+        4. Capture the "Source Quote" so we can verify it.
+        5. Map every row back to the 'SOURCE_ID' (URL) provided in the text.
         
-        INSTRUCTIONS:
-        1. Scan the text for ANY mention of a price, quote, or cost.
-        2. For every price mention, create a data row.
-        3. If a user mentions a range (e.g. "200-300"), use the average (250).
-        4. CONVERT all prices to MONTHLY (if annual, divide by 12. If 6-month, divide by 6).
-        5. LINKING: You MUST map the data back to the 'SOURCE_URL' provided in the text.
-        
-        REQUIRED JSON STRUCTURE:
+        RETURN JSON ONLY:
         {{
             "dataset": [
                 {{
-                    "product_name": "Specific Model/Item",
-                    "brand": "Company Name",
+                    "product_name": "Vehicle Model (or 'Unknown')",
+                    "brand": "Insurance Company (or 'Unknown')",
                     "price_monthly": 123,
                     "location": "City/State",
-                    "user_profile": "Details (Age, History)",
-                    "quote_snippet": "Exact text quote",
-                    "source_url": "The exact URL this quote came from (copied from input)",
-                    "source_title": "The Title of the Reddit thread",
+                    "user_profile": "Age, Credit, Tickets (or 'None')",
+                    "quote_snippet": "The specific text mentioning the price",
+                    "source_url": "The SOURCE_ID url matching this quote",
+                    "source_title": "The Title of the thread",
                     "sentiment": "Positive/Negative/Neutral"
                 }}
             ],
-            "market_summary": "Summary...",
+            "market_summary": "Brief summary of the market.",
             "price_volatility": "High/Medium/Low",
-            "recommendation": "Actionable tip"
+            "recommendation": "One tip for buyers."
         }}
         
-        RAW TEXT DATA:
+        TEXT TO ANALYZE:
         {combined_text}
         """
         
         response = model.generate_content(prompt)
-        cleaned_json = re.sub(r"```json|```", "", response.text).strip()
-        data = json.loads(cleaned_json)
+        text_resp = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text_resp)
         
-        return data, log + ["✅ Deep Analysis Complete!"]
+        return data, log + ["✅ Extraction Complete!"]
 
     except Exception as e:
         return None, log + [f"❌ Error: {str(e)}"]
 
 # --- MAIN UI ---
-st.title("📊 Deep Reddit Analyst")
-st.markdown("Aggregates data from multiple searches to build a **Price vs. Brand** dataset.")
+st.title("🕵️‍♂️ Deep Reddit Market Analyst")
 
 with st.form("search_form"):
-    topic_input = st.text_input("Enter Topic:", "Car Insurance Cost Florida")
-    submitted = st.form_submit_button("🚀 Run Deep Analysis", type="primary")
+    topic_input = st.text_input("Research Topic", "Car Insurance Cost Florida")
+    submitted = st.form_submit_button("🚀 Run Analysis")
 
-if submitted:
-    if not (gemini_key and tavily_key):
-        st.error("Missing Keys.")
-    else:
-        with st.spinner("Running multi-step research..."):
-            data, logs = run_deep_analysis(topic_input, gemini_key, tavily_key)
+if submitted and gemini_key and tavily_key:
+    with st.status("🤖 AI Agent Working...", expanded=True) as status:
+        data, logs = run_deep_analysis(topic_input, gemini_key, tavily_key, search_depth)
+        for l in logs: st.write(l)
+        if data:
             st.session_state.results = data
-            
-            # Show logs in expader
-            with st.expander("Processing Logs"):
-                for l in logs: st.write(l)
+            status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
 
-# --- DISPLAY RESULTS ---
+# --- RESULTS DISPLAY ---
 if st.session_state.results:
     data = st.session_state.results
     
-    # Check if 'dataset' key exists to prevent errors
-    if not data or "dataset" not in data:
-        st.error("The AI did not return a valid dataset. Please try again.")
-    else:
+    if "dataset" in data and data["dataset"]:
         df = pd.DataFrame(data["dataset"])
         
-        if df.empty:
-            st.warning("Analysis finished, but no specific price points were found in the text.")
-        else:
-            # 1. CLEANING: Convert Price to Numbers
-            df['price_monthly'] = pd.to_numeric(df['price_monthly'], errors='coerce')
-            df = df.dropna(subset=['price_monthly']) # Remove rows without prices
+        # 1. Clean Data (Handle missing values safely)
+        df['price_monthly'] = pd.to_numeric(df['price_monthly'], errors='coerce')
+        df = df.dropna(subset=['price_monthly'])
+        
+        # Fill missing string columns to prevent errors
+        for col in ['brand', 'product_name', 'location', 'source_url', 'source_title', 'quote_snippet']:
+            if col not in df.columns:
+                df[col] = "Unknown"
+        
+        st.divider()
+        st.header(f"Results for: {topic_input}")
+
+        tab1, tab2, tab3 = st.tabs(["📊 Market Dashboard", "📝 Raw Data & Sources", "🤖 AI Insights"])
+
+        # === TAB 1: DASHBOARD ===
+        with tab1:
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Data Points", len(df))
+            k2.metric("Median Price", f"${int(df['price_monthly'].median())}/mo")
+            k3.metric("Max Price", f"${int(df['price_monthly'].max())}/mo")
             
             st.divider()
-            st.header(f"Results for: {topic_input}")
             
-            # --- TABBED LAYOUT ---
-            tab1, tab2, tab3 = st.tabs(["📊 Market Dashboard", "📝 Raw Data & Sources", "🤖 AI Insights"])
-            
-            # === TAB 1: DASHBOARD ===
-            with tab1:
-                # KPIS
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Data Points", len(df))
-                k2.metric("Median Price", f"${int(df['price_monthly'].median())}/mo")
-                k3.metric("Lowest Price", f"${int(df['price_monthly'].min())}/mo")
-                k4.metric("Highest Price", f"${int(df['price_monthly'].max())}/mo")
-                
-                st.divider()
-                
-                # CHARTS
-                c1, c2 = st.columns(2)
-                
-                with c1:
-                    st.subheader("💰 Average Price by Brand")
-                    if "brand" in df.columns:
-                        # Calculate average price per brand
-                        brand_stats = df.groupby("brand")['price_monthly'].mean().reset_index()
-                        brand_stats = brand_stats.sort_values("price_monthly", ascending=True)
-                        
-                        fig_bar = px.bar(
-                            brand_stats, 
-                            x='price_monthly', 
-                            y='brand', 
-                            orientation='h', 
-                            text_auto='.0f',
-                            color='price_monthly',
-                            color_continuous_scale='Bluered'
-                        )
-                        st.plotly_chart(fig_bar, use_container_width=True)
-                
-                with c2:
-                    st.subheader("📈 Price Range Distribution")
-                    fig_hist = px.histogram(
-                        df, 
-                        x="price_monthly", 
-                        nbins=15, 
-                        color_discrete_sequence=['#00CC96']
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("💰 Price by Brand")
+                # Error check: Ensure we have data before plotting
+                if not df.empty:
+                    brand_counts = df['brand'].value_counts().reset_index()
+                    brand_counts.columns = ['brand', 'count'] # Rename for safety
+                    
+                    # Only plot brands with > 0 mentions
+                    fig_bar = px.bar(
+                        df.groupby("brand")['price_monthly'].mean().reset_index(), 
+                        x='price_monthly', 
+                        y='brand', 
+                        orientation='h', 
+                        title="Avg Price ($)",
+                        color='price_monthly'
                     )
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                else:
+                    st.info("Not enough data to plot brands.")
+
+            with c2:
+                st.subheader("📈 Price Distribution")
+                if not df.empty:
+                    fig_hist = px.histogram(df, x="price_monthly", nbins=10, title="Price Ranges")
                     st.plotly_chart(fig_hist, use_container_width=True)
 
-            # === TAB 2: RAW DATA & SOURCES ===
-            with tab2:
-                st.markdown("### 🔍 Granular Data Explorer")
-                
-                # Download Button
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Data as CSV", data=csv, file_name="reddit_market_data.csv", mime="text/csv")
-                
-                # Configure the Data Table with Clickable Links
-                # We check if columns exist first to avoid errors
-                cols_to_show = [c for c in ['brand', 'price_monthly', 'product_name', 'location', 'quote_snippet', 'source_url'] if c in df.columns]
-                
-                st.dataframe(
-                    df[cols_to_show],
-                    use_container_width=True,
-                    height=500,
-                    column_config={
-                        "price_monthly": st.column_config.NumberColumn("Price ($/mo)", format="$%d"),
-                        "source_url": st.column_config.LinkColumn("Source Link", display_text="View Thread"),
-                        "quote_snippet": st.column_config.TextColumn("Evidence", width="medium"),
-                    }
-                )
-                
-                st.divider()
-                
-                # BIBLIOGRAPHY SECTION
-                st.markdown("### 📚 Bibliography (Threads Analyzed)")
-                if 'source_title' in df.columns and 'source_url' in df.columns:
-                    unique_sources = df[['source_title', 'source_url']].drop_duplicates()
-                    for _, row in unique_sources.iterrows():
-                        st.markdown(f"- [{row['source_title']}]({row['source_url']})")
-                else:
-                    st.info("Source titles not available in this dataset.")
+        # === TAB 2: RAW DATA ===
+        with tab2:
+            st.markdown("### 🔍 Granular Data")
+            
+            # Safe CSV Download
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download CSV", data=csv, file_name="reddit_data.csv", mime="text/csv")
 
-            # === TAB 3: AI INSIGHTS ===
-            with tab3:
-                st.header("🧠 AI Market Analysis")
-                
-                st.info(f"**Market Summary:** {data.get('market_summary', 'No summary available.')}")
-                
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.warning(f"**Volatility:** {data.get('price_volatility', 'Unknown')}")
-                with col_b:
-                    st.success(f"**Recommendation:** {data.get('recommendation', 'No recommendation available.')}")
-                
-                st.divider()
-                st.markdown("### 🗣️ Notable Quotes")
-                
-                # Filter for sentiments if the column exists
-                if 'sentiment' in df.columns:
-                    neg_reviews = df[df['sentiment'].str.lower().str.contains("neg", na=False)]
-                    pos_reviews = df[df['sentiment'].str.lower().str.contains("pos", na=False)]
-                    
-                    sc1, sc2 = st.columns(2)
-                    with sc1:
-                        st.error("😡 Negative Sentiment Examples")
-                        if not neg_reviews.empty:
-                            for _, row in neg_reviews.head(3).iterrows():
-                                st.markdown(f"> *\"{row.get('quote_snippet', 'No quote')}\"*")
-                                st.caption(f"— {row.get('brand', 'Unknown')} User")
-                        else:
-                            st.write("No negative examples found.")
-                            
-                    with sc2:
-                        st.success("😍 Positive Sentiment Examples")
-                        if not pos_reviews.empty:
-                            for _, row in pos_reviews.head(3).iterrows():
-                                st.markdown(f"> *\"{row.get('quote_snippet', 'No quote')}\"*")
-                                st.caption(f"— {row.get('brand', 'Unknown')} User")
-                        else:
-                            st.write("No positive examples found.")
+            st.dataframe(
+                df[['brand', 'price_monthly', 'product_name', 'location', 'quote_snippet', 'source_url']],
+                use_container_width=True,
+                column_config={
+                    "source_url": st.column_config.LinkColumn("Source", display_text="View Link")
+                }
+            )
+            
+            st.markdown("### 📚 Bibliography")
+            # Deduplicate safely
+            if 'source_title' in df.columns:
+                unique_sources = df[['source_title', 'source_url']].drop_duplicates()
+                for _, row in unique_sources.iterrows():
+                    st.markdown(f"- [{row.get('source_title', 'Link')}]({row.get('source_url', '#')})")
+
+        # === TAB 3: AI INSIGHTS ===
+        with tab3:
+            st.info(f"**Summary:** {data.get('market_summary', 'N/A')}")
+            st.success(f"**Recommendation:** {data.get('recommendation', 'N/A')}")
+
+    else:
+        st.warning("⚠️ Analysis ran, but no specific price data could be extracted from the found threads.")
