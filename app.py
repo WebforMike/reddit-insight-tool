@@ -73,31 +73,40 @@ def run_deep_analysis(topic, gemini_k, tavily_k):
         for t in unique_threads:
             combined_text += f"SOURCE: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{t['content'][:8000]}\n{'='*40}\n"
 
-        # 3. STRUCTURED EXTRACTION (The "Quality" Fix)
-        # We ask for a JSON List of Objects, not just numbers.
+        # 3. ADVANCED "DATA VACUUM" PROMPT
         prompt = f"""
-        You are a Data Scientist. I have scraped {len(unique_threads)} Reddit threads about "{topic}".
+        You are an Expert Data Extraction Agent. I have scraped Reddit discussions about "{topic}".
         
-        Your Goal: Build a structured dataset of every specific price mention.
+        Your Goal: specific, tabular data extraction. Do NOT summarize yet.
         
-        Instructions:
-        1. Identify every user who mentioned a price they pay or were quoted.
-        2. Extract the specific "Insurer/Brand" if mentioned (e.g., Geico, Progressive). If unknown, use "Unknown".
-        3. Extract the "Context" (e.g., "23M, clean record", "2015 Honda", "Full coverage").
-        4. Extract the "Price" converted to a MONTHLY integer (e.g. $600/6-months -> 100).
-        5. Extract the "Sentiment" of that specific user (Positive/Negative/Neutral).
-
-        Return JSON ONLY with this structure:
+        INSTRUCTIONS:
+        1. Scan the text for ANY mention of a price, quote, or cost.
+        2. For every price mention, create a data row.
+        3. If a user mentions a range (e.g. "200-300"), use the average (250).
+        4. CONVERT all prices to MONTHLY (if annual, divide by 12. If 6-month, divide by 6).
+        5. LINKING: You MUST map the data back to the 'SOURCE_URL' provided in the text.
+        
+        REQUIRED JSON STRUCTURE:
         {{
             "dataset": [
-                {{ "insurer": "Geico", "price_monthly": 150, "context": "2020 Civic, 25yo male", "sentiment": "Positive", "source_title": "..." }},
-                ...
+                {{
+                    "product_name": "Specific Model/Item",
+                    "brand": "Company Name",
+                    "price_monthly": 123,
+                    "location": "City/State",
+                    "user_profile": "Details (Age, History)",
+                    "quote_snippet": "Exact text quote",
+                    "source_url": "The exact URL this quote came from (copied from input)",
+                    "source_title": "The Title of the Reddit thread",
+                    "sentiment": "Positive/Negative/Neutral"
+                }}
             ],
-            "summary": "Overall market summary...",
-            "key_insight": "The most important takeaway..."
+            "market_summary": "Summary...",
+            "price_volatility": "High/Medium/Low",
+            "recommendation": "Actionable tip"
         }}
         
-        DATA:
+        RAW TEXT DATA:
         {combined_text}
         """
         
@@ -133,49 +142,137 @@ if submitted:
 # --- DISPLAY RESULTS ---
 if st.session_state.results:
     data = st.session_state.results
-    rows = data.get("dataset", [])
     
-    if not rows:
-        st.warning("No specific price data points found in these threads.")
+    # Check if 'dataset' key exists to prevent errors
+    if not data or "dataset" not in data:
+        st.error("The AI did not return a valid dataset. Please try again.")
     else:
-        # Convert to DataFrame for powerful display
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(data["dataset"])
         
-        st.divider()
-        st.header(f"Results for: {topic_input}")
-        
-        # 1. HIGH LEVEL STATS
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Data Points Found", len(df))
-        c2.metric("Average Price", f"${int(df['price_monthly'].mean())}/mo")
-        c3.metric("Median Price", f"${int(df['price_monthly'].median())}/mo")
-        
-        # 2. PRICE BY INSURER (The "Context" you wanted)
-        st.subheader("🏆 Price & Sentiment by Brand")
-        
-        if "insurer" in df.columns:
-            # Group by Insurer
-            grouped = df.groupby("insurer").agg({
-                "price_monthly": "mean",
-                "sentiment": lambda x: x.mode()[0] if not x.mode().empty else "Mixed",
-                "context": "count"
-            }).rename(columns={"context": "count", "price_monthly": "avg_price"}).sort_values("count", ascending=False)
+        if df.empty:
+            st.warning("Analysis finished, but no specific price points were found in the text.")
+        else:
+            # 1. CLEANING: Convert Price to Numbers
+            df['price_monthly'] = pd.to_numeric(df['price_monthly'], errors='coerce')
+            df = df.dropna(subset=['price_monthly']) # Remove rows without prices
             
-            st.dataframe(grouped, use_container_width=True)
+            st.divider()
+            st.header(f"Results for: {topic_input}")
             
-            # Simple Bar Chart
-            st.bar_chart(df.set_index("insurer")["price_monthly"])
+            # --- TABBED LAYOUT ---
+            tab1, tab2, tab3 = st.tabs(["📊 Market Dashboard", "📝 Raw Data & Sources", "🤖 AI Insights"])
+            
+            # === TAB 1: DASHBOARD ===
+            with tab1:
+                # KPIS
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Data Points", len(df))
+                k2.metric("Median Price", f"${int(df['price_monthly'].median())}/mo")
+                k3.metric("Lowest Price", f"${int(df['price_monthly'].min())}/mo")
+                k4.metric("Highest Price", f"${int(df['price_monthly'].max())}/mo")
+                
+                st.divider()
+                
+                # CHARTS
+                c1, c2 = st.columns(2)
+                
+                with c1:
+                    st.subheader("💰 Average Price by Brand")
+                    if "brand" in df.columns:
+                        # Calculate average price per brand
+                        brand_stats = df.groupby("brand")['price_monthly'].mean().reset_index()
+                        brand_stats = brand_stats.sort_values("price_monthly", ascending=True)
+                        
+                        fig_bar = px.bar(
+                            brand_stats, 
+                            x='price_monthly', 
+                            y='brand', 
+                            orientation='h', 
+                            text_auto='.0f',
+                            color='price_monthly',
+                            color_continuous_scale='Bluered'
+                        )
+                        st.plotly_chart(fig_bar, use_container_width=True)
+                
+                with c2:
+                    st.subheader("📈 Price Range Distribution")
+                    fig_hist = px.histogram(
+                        df, 
+                        x="price_monthly", 
+                        nbins=15, 
+                        color_discrete_sequence=['#00CC96']
+                    )
+                    st.plotly_chart(fig_hist, use_container_width=True)
 
-        # 3. DETAILED DATA TABLE (Transparency)
-        st.subheader("📝 Raw Data Extracted")
-        st.markdown("This is the exact data the AI found. You can sort by price.")
-        st.dataframe(
-            df[["insurer", "price_monthly", "context", "sentiment"]], 
-            use_container_width=True,
-            hide_index=True
-        )
+            # === TAB 2: RAW DATA & SOURCES ===
+            with tab2:
+                st.markdown("### 🔍 Granular Data Explorer")
+                
+                # Download Button
+                csv = df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Data as CSV", data=csv, file_name="reddit_market_data.csv", mime="text/csv")
+                
+                # Configure the Data Table with Clickable Links
+                # We check if columns exist first to avoid errors
+                cols_to_show = [c for c in ['brand', 'price_monthly', 'product_name', 'location', 'quote_snippet', 'source_url'] if c in df.columns]
+                
+                st.dataframe(
+                    df[cols_to_show],
+                    use_container_width=True,
+                    height=500,
+                    column_config={
+                        "price_monthly": st.column_config.NumberColumn("Price ($/mo)", format="$%d"),
+                        "source_url": st.column_config.LinkColumn("Source Link", display_text="View Thread"),
+                        "quote_snippet": st.column_config.TextColumn("Evidence", width="medium"),
+                    }
+                )
+                
+                st.divider()
+                
+                # BIBLIOGRAPHY SECTION
+                st.markdown("### 📚 Bibliography (Threads Analyzed)")
+                if 'source_title' in df.columns and 'source_url' in df.columns:
+                    unique_sources = df[['source_title', 'source_url']].drop_duplicates()
+                    for _, row in unique_sources.iterrows():
+                        st.markdown(f"- [{row['source_title']}]({row['source_url']})")
+                else:
+                    st.info("Source titles not available in this dataset.")
 
-        # 4. SUMMARY
-        st.subheader("💡 Analysis")
-        st.write(data.get("summary"))
-        st.info(f"**Key Insight:** {data.get('key_insight')}")
+            # === TAB 3: AI INSIGHTS ===
+            with tab3:
+                st.header("🧠 AI Market Analysis")
+                
+                st.info(f"**Market Summary:** {data.get('market_summary', 'No summary available.')}")
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.warning(f"**Volatility:** {data.get('price_volatility', 'Unknown')}")
+                with col_b:
+                    st.success(f"**Recommendation:** {data.get('recommendation', 'No recommendation available.')}")
+                
+                st.divider()
+                st.markdown("### 🗣️ Notable Quotes")
+                
+                # Filter for sentiments if the column exists
+                if 'sentiment' in df.columns:
+                    neg_reviews = df[df['sentiment'].str.lower().str.contains("neg", na=False)]
+                    pos_reviews = df[df['sentiment'].str.lower().str.contains("pos", na=False)]
+                    
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        st.error("😡 Negative Sentiment Examples")
+                        if not neg_reviews.empty:
+                            for _, row in neg_reviews.head(3).iterrows():
+                                st.markdown(f"> *\"{row.get('quote_snippet', 'No quote')}\"*")
+                                st.caption(f"— {row.get('brand', 'Unknown')} User")
+                        else:
+                            st.write("No negative examples found.")
+                            
+                    with sc2:
+                        st.success("😍 Positive Sentiment Examples")
+                        if not pos_reviews.empty:
+                            for _, row in pos_reviews.head(3).iterrows():
+                                st.markdown(f"> *\"{row.get('quote_snippet', 'No quote')}\"*")
+                                st.caption(f"— {row.get('brand', 'Unknown')} User")
+                        else:
+                            st.write("No positive examples found.")
