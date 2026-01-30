@@ -35,18 +35,16 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
         model = genai.GenerativeModel('gemini-2.5-flash') 
 
         # ==========================================
-        # PHASE 1: DISCOVERY (Find the URLs)
+        # PHASE 1: INTELLIGENT GATHERING
         # ==========================================
         target_urls = []
         
         if mode == "Search":
-            # We use a broad search just to grab the Links.
-            # We do NOT filter by content length here anymore.
+            # BROAD DISCOVERY
             queries = [
                 f"site:reddit.com {input_data}", 
-                f"site:reddit.com {input_data} cost",
-                f"site:reddit.com {input_data} quote",
-                f"site:reddit.com {input_data} price"
+                f"site:reddit.com {input_data} price paid",
+                f"site:reddit.com {input_data} quote received"
             ]
             
             progress_bar = st.progress(0)
@@ -54,73 +52,77 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
             for i, q in enumerate(queries):
                 log.append(f"🕵️ Scout Query {i+1}: '{q}'...")
                 try:
-                    # We just want the URLs, so search_depth="basic" is faster for discovery
-                    response = tavily.search(query=q, search_depth="advanced", max_results=5)
+                    # We grab raw content immediately here as a backup
+                    response = tavily.search(query=q, search_depth="advanced", max_results=5, include_raw_content=True)
                     
                     for item in response.get('results', []):
                         url = item['url']
-                        # Basic dedup
-                        if url not in target_urls and "reddit.com" in url:
-                            target_urls.append(url)
+                        content = item.get('raw_content', '')
+                        
+                        if url not in final_content_map and len(content) > 500:
+                            final_content_map[url] = {
+                                "title": item['title'],
+                                "url": url,
+                                "content": content
+                            }
                             
                 except Exception as e:
                     log.append(f"⚠️ Search error: {e}")
                 
                 time.sleep(0.3)
                 progress_bar.progress((i + 1) / len(queries))
-            
-            # Limit to the requested depth
-            target_urls = target_urls[:depth]
-            log.append(f"🎯 identified {len(target_urls)} promising threads to crawl.")
 
         elif mode == "Direct URL":
-            target_urls = [u.strip() for u in input_data.split(",") if "reddit.com" in u]
-
-        if not target_urls:
-            return None, log + ["❌ No Reddit URLs found. Try a broader topic."]
-
-        # ==========================================
-        # PHASE 2: HARVESTING (Extract Full Content)
-        # ==========================================
-        log.append(f"🚜 Crawling {len(target_urls)} threads for deep comments...")
-        
-        # We explicitly call 'extract' on the URLs we found.
-        # This bypasses the "short snippet" issue.
-        try:
-            # Check if using the extract feature (supports batch)
-            extracted_data = tavily.extract(urls=target_urls, include_images=False)
+            # HYBRID CRAWL STRATEGY
+            urls = [u.strip() for u in input_data.split(",") if "reddit.com" in u]
+            log.append(f"🕷️ Attempting to crawl {len(urls)} links...")
             
-            results_list = extracted_data.get('results', [])
-            
-            for item in results_list:
-                url = item['url']
-                raw_text = item.get('raw_content', '')
-                
-                # NOW we check length, but on the full extraction, not the snippet
-                if len(raw_text) > 500:
-                    final_content_map[url] = {
-                        "title": "Reddit Thread", # Extract doesn't always give title, generic is fine
-                        "url": url,
-                        "content": raw_text
-                    }
-                else:
-                    log.append(f"⚠️ Skipped {url} (Content blocked or empty)")
+            for url in urls:
+                # STRATEGY A: Direct Extraction (Best quality, but risky)
+                crawled_content = ""
+                try:
+                    response = tavily.extract(urls=[url], include_images=False)
+                    raw_res = response.get('results', [])[0]
+                    crawled_content = raw_res.get('raw_content', '')
+                except:
+                    pass
+
+                # CHECK: Did we get blocked?
+                if len(crawled_content) < 600 or "Whoops" in crawled_content:
+                    log.append(f"⚠️ Direct crawl blocked for {url}. Switching to Cache Search...")
                     
-        except Exception as e:
-            log.append(f"⚠️ Extraction Error: {e}")
+                    # STRATEGY B: Search Cache Bypass (Reliable)
+                    try:
+                        # Search specifically for this URL to find the cached snippet
+                        search_res = tavily.search(query=url, search_depth="advanced", max_results=1, include_raw_content=True)
+                        if search_res.get('results'):
+                            crawled_content = search_res['results'][0].get('raw_content', '')
+                            log.append(f"✅ Recovered content via Cache ({len(crawled_content)} chars)")
+                        else:
+                             log.append(f"❌ Cache failed for {url}")
+                    except Exception as e:
+                        log.append(f"❌ Recovery failed: {e}")
+                else:
+                    log.append(f"✅ Direct crawl success ({len(crawled_content)} chars)")
 
-        valid_thread_count = len(final_content_map)
-        if valid_thread_count == 0:
-            return None, log + ["❌ Crawled threads, but content was empty/blocked. Reddit might be blocking the bot."]
+                if len(crawled_content) > 300:
+                    final_content_map[url] = {
+                        "title": "Direct Import",
+                        "url": url,
+                        "content": crawled_content
+                    }
 
-        log.append(f"✅ Successfully extracted full text from {valid_thread_count} threads.")
+        if not final_content_map:
+            return None, log + ["❌ No accessible text found. Reddit likely blocked all attempts."]
 
         # ==========================================
-        # PHASE 3: AI EXTRACTION
+        # PHASE 2: "MESSY DATA" EXTRACTION
         # ==========================================
+        log.append(f"🧠 Analyzing {len(final_content_map)} threads with Gemini 2.0...")
+        
         combined_text = ""
         for url, data in final_content_map.items():
-            combined_text += f"SOURCE_ID: {url}\nCONTENT:\n{data['content'][:20000]}\n{'='*40}\n"
+            combined_text += f"SOURCE_ID: {url}\nCONTENT:\n{data['content'][:25000]}\n{'='*40}\n"
 
         prompt = f"""
         You are an Expert Data Actuary.
@@ -133,7 +135,7 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
         3. **Context:** Capture the exact quote in "quote_snippet".
         4. **Source:** Map the data back to the 'SOURCE_ID' (URL).
         
-        RETURN JSON:
+        RETURN JSON ONLY:
         {{
             "dataset": [
                 {{
@@ -156,7 +158,16 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
         
         response = model.generate_content(prompt)
         text_resp = response.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text_resp)
+        
+        # Save raw debug text for the user to see
+        raw_debug_text = combined_text
+        
+        try:
+            data = json.loads(text_resp)
+            # Attach debug text to data object for UI
+            data['raw_debug'] = raw_debug_text 
+        except:
+            return None, log + ["❌ AI output was not valid JSON."]
             
         return data, log + ["✅ AI Analysis Complete!"]
 
@@ -164,7 +175,7 @@ def run_analysis(mode, input_data, gemini_k, tavily_k, depth):
         return None, log + [f"❌ Critical Pipeline Error: {str(e)}"]
 
 # --- MAIN UI ---
-st.title("🕷️ Deep Reddit Crawler (Search & Extract)")
+st.title("🕷️ Deep Reddit Crawler (Anti-Block)")
 
 tab_search, tab_direct = st.tabs(["🔎 Auto-Search", "🔗 Direct Link"])
 
@@ -201,7 +212,7 @@ if st.session_state.results:
         st.divider()
         st.header("📊 Extraction Results")
         
-        t1, t2 = st.tabs(["Dashboard", "Raw Data Table"])
+        t1, t2, t3, t4 = st.tabs(["Dashboard", "Raw Data Table", "Insights", "🕷️ Debug View"])
         
         with t1:
             valid = df[df['price_monthly'] > 0]
@@ -221,5 +232,16 @@ if st.session_state.results:
                 use_container_width=True,
                 column_config={"source_url": st.column_config.LinkColumn("Source")}
             )
+            
+        with t3:
+             st.info(data.get("market_summary"))
+             st.success(data.get("recommendation"))
+
+        # --- DEBUG TAB ---
+        with t4:
+            st.markdown("### 🕵️‍♂️ Audit: What did the AI actually read?")
+            st.warning("This is the raw text extracted. If this is 'Whoops' or empty, Reddit blocked the crawler.")
+            st.text_area("Raw Content", value=data.get('raw_debug', 'No debug info'), height=400)
+
     else:
         st.warning("Pipeline finished, but AI found no price data in the text.")
