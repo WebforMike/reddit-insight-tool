@@ -1,4 +1,5 @@
 streamlit
+plotly
+pandas
 google-generativeai
 tavily-python
-requests
