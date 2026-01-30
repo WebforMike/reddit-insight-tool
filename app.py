@@ -6,6 +6,7 @@ import json
 import re
 import os
 import statistics
+import time
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(page_title="Reddit Insight Pro", page_icon="🧠", layout="wide")
@@ -14,133 +15,138 @@ st.set_page_config(page_title="Reddit Insight Pro", page_icon="🧠", layout="wi
 with st.sidebar:
     st.header("🔑 API Keys")
     
-    # Try to load from Streamlit Secrets or Environment Variables first
     gemini_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not gemini_key:
         gemini_key = st.text_input("Gemini API Key", type="password")
-        if not gemini_key:
-            st.info("Get a free key at aistudio.google.com")
 
     tavily_key = st.secrets.get("TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY")
     if not tavily_key:
         tavily_key = st.text_input("Tavily API Key", type="password")
-        if not tavily_key:
-            st.info("Get a free key at tavily.com")
 
-# --- 3. HELPER FUNCTION: FETCH REDDIT DATA ---
-def fetch_smart_reddit_content(url):
+# --- 3. HELPER FUNCTION: ROBUST FETCHING ---
+def fetch_content_hybrid(url, fallback_text=None):
     """
-    Fetches Reddit data, sorts by 'Top' to get best answers, 
-    and filters out bots/spam before sending to AI.
+    Attempts to fetch high-quality JSON from Reddit.
+    If blocked (429/403), falls back to the text Tavily found.
     """
+    # PLAN A: Try Direct JSON (Best Quality)
     try:
-        # Clean URL and force JSON + Sort by Top
         clean_url = url.split('?')[0].rstrip('/')
-        if "reddit.com" not in clean_url: return None
         json_url = f"{clean_url}.json?sort=top"
 
-        # Fake Browser Headers (Crucial to avoid 429 errors)
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.google.com/'
         }
 
-        response = requests.get(json_url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
-
-        data = response.json()
+        # Short timeout to fail fast if blocked
+        response = requests.get(json_url, headers=headers, timeout=5)
         
-        # Parse Main Post
-        post_data = data[0]['data']['children'][0]['data']
-        content = f"--- THREAD START ---\n"
-        content += f"TITLE: {post_data.get('title', 'Unknown')}\n"
-        content += f"SCORE: {post_data.get('score', 0)}\n"
-        content += f"BODY: {post_data.get('selftext', '')[:1000]}\n"
-        content += "--- TOP COMMENTS ---\n"
-
-        # Parse Comments (Filter bots & low quality)
-        comments_data = data[1]['data']['children']
-        for i, c in enumerate(comments_data[:15]): # Top 15 comments
-            comment = c.get('data', {})
-            author = comment.get('author', '[deleted]')
+        if response.status_code == 200:
+            data = response.json()
+            # Parse Main Post
+            post = data[0]['data']['children'][0]['data']
+            content = f"--- THREAD: {post.get('title', 'Unknown')} ---\n"
+            content += f"SCORE: {post.get('score', 0)}\n"
+            content += f"BODY: {post.get('selftext', '')[:1000]}\n"
+            content += "--- BEST COMMENTS ---\n"
             
-            # Skip bots and deleted comments
-            if author.lower() in ['automoderator', '[deleted]', '[removed]']:
-                continue
-            if comment.get('stickied'): 
-                continue
-                
-            content += f"[Comment] [Score: {comment.get('score', 0)}] {comment.get('body', '')[:800]}\n\n"
+            # Parse Comments
+            comments = data[1]['data']['children']
+            for c in comments[:15]:
+                d = c.get('data', {})
+                if d.get('author') not in ['[deleted]', 'AutoModerator']:
+                    content += f"[Score: {d.get('score',0)}] {d.get('body', '')[:600]}\n\n"
             
-        return content
+            return content, "Direct"
 
     except Exception as e:
-        print(f"Error reading {url}: {e}")
-        return None
+        pass # Plan A failed, proceed to Plan B
+
+    # PLAN B: Use Tavily's Backup Text (Reliable)
+    if fallback_text:
+        # Clean up the fallback text a bit
+        clean_fallback = fallback_text[:2500] # Limit length
+        return f"--- SOURCE (TAVILY BACKUP) ---\nURL: {url}\nCONTENT: {clean_fallback}", "Backup"
+    
+    return None, "Failed"
 
 # --- 4. MAIN APP UI ---
-st.title("🧠 Reddit Insight Miner (Pro)")
-st.markdown("Enter a topic. The AI will find threads, extract raw data, and calculate real statistics.")
+st.title("🧠 Reddit Insight Miner (Anti-Block Version)")
+st.markdown("Finds threads and calculates market statistics. Includes **Cloud-Bypass** technology.")
 
 topic = st.text_input("Enter Topic:", "Car Insurance Cost Florida")
 
 if st.button("🚀 Mine Insights", type="primary"):
     
-    # Validation
     if not (gemini_key and tavily_key):
-        st.error("⚠️ Please enter both API Keys in the sidebar to proceed.")
+        st.error("⚠️ Please enter both API Keys in the sidebar.")
         st.stop()
 
-    # Initialize Clients
     try:
         tavily = TavilyClient(api_key=tavily_key)
         genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel('gemini-2.0-flash') # Using the model we confirmed works
+        model = genai.GenerativeModel('gemini-2.0-flash') 
     except Exception as e:
-        st.error(f"Connection Error: {e}")
+        st.error(f"Setup Error: {e}")
         st.stop()
 
     # Step A: Search
-    status = st.status("🕵️ Searching Reddit...", expanded=True)
+    status = st.status("🕵️ Searching...", expanded=True)
     try:
-        # Search specifically on reddit.com
+        # CRITICAL: We ask Tavily for 'include_raw_content' so we have a backup if Reddit blocks us
         search_result = tavily.search(
             query=f"site:reddit.com {topic}", 
             search_depth="advanced", 
-            max_results=5
+            max_results=5,
+            include_raw_content=True 
         )
         threads = search_result.get('results', [])
         
         if not threads:
-            status.update(label="❌ No threads found", state="error")
+            status.update(label="❌ No threads found.", state="error")
             st.stop()
             
-        status.write(f"✅ Found {len(threads)} threads. Scraping content...")
+        status.write(f"✅ Found {len(threads)} threads. fetching details...")
     except Exception as e:
         st.error(f"Search failed: {e}")
         st.stop()
 
-    # Step B: Scrape Content
+    # Step B: Hybrid Fetch
     combined_context = ""
     valid_count = 0
+    direct_hits = 0
+    backup_hits = 0
+    
     progress = st.progress(0)
     
     for i, t in enumerate(threads):
-        status.write(f"Reading: {t['title'][:40]}...")
-        raw_text = fetch_smart_reddit_content(t['url'])
+        status.write(f"Reading: {t['title'][:30]}...")
         
-        if raw_text:
-            combined_context += f"SOURCE URL: {t['url']}\n{raw_text}\n{'='*40}\n"
+        # We pass BOTH the url and the raw_content Tavily found
+        text, method = fetch_content_hybrid(t['url'], t.get('raw_content'))
+        
+        if text:
+            combined_context += f"{text}\n{'='*40}\n"
             valid_count += 1
+            if method == "Direct": direct_hits += 1
+            else: backup_hits += 1
         
+        # Be nice to the API
+        time.sleep(0.5)
         progress.progress((i + 1) / len(threads))
 
     if valid_count == 0:
-        status.update(label="❌ Reddit blocked access to all threads.", state="error")
+        status.update(label="❌ All access blocked.", state="error")
+        st.error("Could not read any data. Reddit is blocking both direct access and search crawlers.")
         st.stop()
 
-    # Step C: Analyze & Calculate
-    status.write("🧠 AI Extracting data & Python calculating stats...")
+    status.write(f"✅ Read {valid_count} threads ({direct_hits} Direct, {backup_hits} Backup).")
+
+    # Step C: Analyze
+    status.write("🧠 Extracting statistics...")
     
     prompt = f"""
     You are a Data Extractor. Analyze these Reddit threads about "{topic}".
@@ -163,10 +169,9 @@ if st.button("🚀 Mine Insights", type="primary"):
         cleaned_json = re.sub(r"```json|```", "", response.text).strip()
         data = json.loads(cleaned_json)
         
-        # PYTHON MATH SECTION
+        # Python Math
         raw_prices = data.get("raw_prices", [])
         stats = {}
-        
         if raw_prices:
             stats['min'] = min(raw_prices)
             stats['max'] = max(raw_prices)
@@ -176,36 +181,33 @@ if st.button("🚀 Mine Insights", type="primary"):
         else:
             stats = {'min': 0, 'max': 0, 'avg': 0, 'median': 0, 'count': 0}
 
-        status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
+        status.update(label="✅ Success!", state="complete", expanded=False)
         
-        # Step D: Dashboard Display
+        # Step D: Display
         st.divider()
         st.header(f"🧮 Market Report: {topic}")
         
-        # 1. Top Metrics
         c1, c2, c3, c4 = st.columns(4)
         currency = data.get("currency", "$")
         
-        c1.metric("Average Price", f"{currency}{stats['avg']}")
-        c2.metric("Median Price", f"{currency}{stats['median']}")
-        c3.metric("Lowest Found", f"{currency}{stats['min']}")
-        c4.metric("Highest Found", f"{currency}{stats['max']}")
+        c1.metric("Average", f"{currency}{stats['avg']}")
+        c2.metric("Median", f"{currency}{stats['median']}")
+        c3.metric("Lowest", f"{currency}{stats['min']}")
+        c4.metric("Highest", f"{currency}{stats['max']}")
         
-        st.caption(f"Calculated from {stats['count']} data points found in discussion.")
+        st.caption(f"Calculated from {stats['count']} data points.")
         
-        # 2. Summary & Sentiment
-        st.subheader("📝 Analysis")
+        st.subheader("📝 Summary")
         st.write(data.get("summary"))
-        st.info(f"Overall Sentiment: **{data.get('sentiment')}**")
+        
+        if backup_hits > 0:
+            st.warning(f"Note: {backup_hits} threads were read using Backup Mode (Reddit blocked direct access). Data may be less detailed.")
 
-        # 3. Transparency (Raw Data)
-        with st.expander("See raw numbers used for calculation"):
-            st.write(f"Extracted Prices: {raw_prices}")
-            
-        with st.expander("See Sources"):
+        with st.expander("See Raw Data & Sources"):
+            st.write(f"Prices used: {raw_prices}")
             for t in threads:
                 st.markdown(f"- [{t['title']}]({t['url']})")
 
     except Exception as e:
-        status.update(label="❌ Error", state="error")
-        st.error(f"Analysis Error: {e}")
+        status.update(label="❌ AI Error", state="error")
+        st.error(f"Error: {e}")
