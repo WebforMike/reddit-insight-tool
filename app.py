@@ -9,9 +9,9 @@ import statistics
 import time
 
 # --- 1. PAGE CONFIGURATION ---
-st.set_page_config(page_title="Reddit Insight Miner", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Reddit Insight Miner", page_icon="🛡️", layout="wide")
 
-# --- 2. SESSION STATE SETUP (Keeps data on screen) ---
+# --- 2. SESSION STATE ---
 if "results" not in st.session_state:
     st.session_state.results = None
 if "status_log" not in st.session_state:
@@ -21,7 +21,6 @@ if "status_log" not in st.session_state:
 with st.sidebar:
     st.header("🔑 API Keys")
     
-    # We check secrets first, then allow manual entry
     gemini_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not gemini_key:
         gemini_key = st.text_input("Gemini API Key", type="password")
@@ -30,57 +29,68 @@ with st.sidebar:
     if not tavily_key:
         tavily_key = st.text_input("Tavily API Key", type="password")
 
-    jina_key = st.secrets.get("JINA_API_KEY") or os.getenv("JINA_API_KEY")
-    if not jina_key:
-        jina_key = st.text_input("Jina API Key", type="password")
-        st.caption("Get one free at jina.ai/reader")
-
-# --- 4. HELPER FUNCTIONS ---
-def fetch_with_jina(url, api_key):
-    if not api_key: return None, "Missing Key"
-    try:
-        headers = {'Authorization': f'Bearer {api_key}', 'X-Return-Format': 'markdown'}
-        response = requests.get(f"https://r.jina.ai/{url}", headers=headers, timeout=25)
-        return (response.text, "Success") if response.status_code == 200 else (None, f"Error {response.status_code}")
-    except Exception as e:
-        return None, str(e)
-
-def run_analysis(topic, gemini_k, tavily_k, jina_k):
-    """Main logic function called on form submit"""
+    # Jina is removed because it is getting blocked.
+    
+# --- 4. LOGIC: TAVILY CACHE MODE ---
+def run_analysis_cached(topic, gemini_k, tavily_k):
     log = []
     try:
-        # Init Clients
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
-        model = genai.GenerativeModel('gemini-2.5-flash') # Or 'gemini-1.5-flash' if 2.0 fails
+        model = genai.GenerativeModel('gemini-2.0-flash')
 
-        # 1. Search
-        log.append(f"🕵️ Searching Reddit for '{topic}'...")
-        search_result = tavily.search(query=f"site:reddit.com {topic}", search_depth="advanced", max_results=5)
+        # 1. SEARCH WITH RAW CONTENT (The Fix)
+        # We assume Reddit will block any direct visit, so we ask Tavily 
+        # to give us the 'raw_content' it scraped during indexing.
+        log.append(f"🕵️ Searching Reddit cache for '{topic}'...")
+        
+        search_result = tavily.search(
+            query=f"site:reddit.com {topic}", 
+            search_depth="advanced", 
+            max_results=5, 
+            include_raw_content=True # <--- CRITICAL: Get text immediately
+        )
+        
         threads = search_result.get('results', [])
         
         if not threads:
             return None, log + ["❌ No threads found."]
 
-        # 2. Scrape
-        log.append(f"✅ Found {len(threads)} threads. Scraping via Jina...")
+        # 2. COMPILE TEXT
         combined_text = ""
         valid_count = 0
         
         for t in threads:
-            content, msg = fetch_with_jina(t['url'], jina_k)
-            if content:
-                combined_text += f"SOURCE: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{content[:5000]}\n{'='*40}\n"
+            # We prioritize 'raw_content' (Full page cache).
+            # If that fails, we use 'content' (Snippet).
+            # We DO NOT visit the URL (avoids 403 Forbidden).
+            
+            source_text = t.get('raw_content')
+            source_type = "Full Cache"
+            
+            if not source_text or len(source_text) < 100:
+                source_text = t.get('content')
+                source_type = "Snippet"
+            
+            if source_text:
+                combined_text += f"SOURCE: {t['url']}\nTYPE: {source_type}\nCONTENT:\n{source_text[:6000]}\n{'='*40}\n"
                 valid_count += 1
-            time.sleep(0.2)
+                log.append(f"✅ Loaded {source_type}: {t['title'][:30]}...")
+            else:
+                log.append(f"⚠️ Skipped {t['title'][:30]} (No text)")
             
         if valid_count == 0:
-            return None, log + ["❌ All threads were blocked or empty."]
+            return None, log + ["❌ Tavily found links but no text data attached."]
 
-        # 3. Analyze
-        log.append("🧠 Analyzing data with Gemini...")
+        # 3. ANALYZE
+        log.append("🧠 Analyzing cached data with Gemini...")
+        
         prompt = f"""
         Analyze these Reddit threads about "{topic}".
+        
+        Goal: Extract specific prices. 
+        Note: Data may be messy/raw. Do your best to find numbers.
+        
         Return JSON ONLY:
         - "raw_prices": [list of integers].
         - "sentiment": "Positive/Negative/Neutral".
@@ -91,41 +101,39 @@ def run_analysis(topic, gemini_k, tavily_k, jina_k):
         DATA:
         {combined_text}
         """
+        
         response = model.generate_content(prompt)
         cleaned_json = re.sub(r"```json|```", "", response.text).strip()
         data = json.loads(cleaned_json)
-        
-        # Add sources to data for display
         data["sources"] = threads
+        
         return data, log + ["✅ Analysis Complete!"]
 
     except Exception as e:
         return None, log + [f"❌ Error: {str(e)}"]
 
-# --- 5. MAIN APP UI ---
-st.title("⚡ Reddit Insight Miner")
-st.markdown("Enter a topic below. Using **Jina** (Scraping) + **Gemini** (AI).")
+# --- 5. MAIN UI ---
+st.title("🛡️ Reddit Insight (Block-Proof)")
+st.markdown("Uses **Tavily's Cached Data** to bypass Reddit's firewalls completely.")
 
-# --- THE FIX: USE A FORM ---
 with st.form("search_form"):
     topic_input = st.text_input("Enter Topic:", "Car Insurance Cost Florida")
-    # This button now triggers the form submission properly
     submitted = st.form_submit_button("🚀 Mine Insights", type="primary")
 
 if submitted:
-    if not (gemini_key and tavily_key and jina_key):
-        st.error("⚠️ Please enter ALL API keys in the sidebar first!")
+    if not (gemini_key and tavily_key):
+        st.error("⚠️ Please enter Gemini and Tavily keys.")
     else:
-        with st.spinner("Agent is working... (This may take 15-30 seconds)"):
-            data, logs = run_analysis(topic_input, gemini_key, tavily_key, jina_key)
+        with st.spinner("Mining data from search cache..."):
+            data, logs = run_analysis_cached(topic_input, gemini_key, tavily_key)
             st.session_state.results = data
             st.session_state.status_log = logs
 
-# --- 6. DISPLAY RESULTS (FROM SESSION STATE) ---
+# --- 6. DISPLAY ---
 if st.session_state.results:
     data = st.session_state.results
     
-    # Statistics
+    # Math
     raw_prices = data.get("raw_prices", [])
     stats = {'min': 0, 'max': 0, 'avg': 0, 'median': 0, 'count': 0}
     if raw_prices:
@@ -156,8 +164,7 @@ if st.session_state.results:
         for s in data.get("sources", []):
             st.markdown(f"- [{s['title']}]({s['url']})")
 
-# Debug Logs (Optional, helps you see what happened)
 if st.session_state.status_log:
-    with st.expander("View Processing Logs"):
+    with st.expander("Processing Logs"):
         for msg in st.session_state.status_log:
             st.write(msg)
