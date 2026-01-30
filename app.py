@@ -19,12 +19,16 @@ with st.sidebar:
     st.header("🔑 API Keys")
     
     # 1. GEMINI KEY
-    gemini_key = st.text_input("Gemini API Key", type="password")
+    gemini_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not gemini_key:
-        st.info("Get a free key at aistudio.google.com")
+        gemini_key = st.text_input("Gemini API Key", type="password")
+        if not gemini_key:
+            st.info("Get a free key at aistudio.google.com")
 
-    # 2. TAVILY KEY (Paste your tvly- key here)
-    tavily_key = st.text_input("Tavily API Key", value="", type="password")
+    # 2. TAVILY KEY
+    tavily_key = st.secrets.get("TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY")
+    if not tavily_key:
+        tavily_key = st.text_input("Tavily API Key", value="", type="password")
 
 # --- MAIN LOGIC ---
 topic = st.text_input("Enter a Topic to Research:", placeholder="e.g. Best homeowners insurance for flood zones")
@@ -51,7 +55,6 @@ if st.button("🚀 Find & Analyze Threads", type="primary"):
     try:
         status_box.write(f"Searching the web for Reddit threads about: '{topic}'...")
         
-        # This command searches ONLY reddit.com and grabs the text content
         search_result = tavily.search(
             query=f"site:reddit.com {topic}", 
             search_depth="advanced", 
@@ -68,10 +71,20 @@ if st.button("🚀 Find & Analyze Threads", type="primary"):
             
         status_box.write(f"✅ Found {len(threads)} relevant threads.")
         
-        # Prepare text for AI
+        # --- SHOW LINKS IMMEDIATELY ---
+        st.subheader("🔗 Sources Found")
+        for t in threads:
+            st.markdown(f"- [{t['title']}]({t['url']})")
+        
+        # Prepare text for AI (CRASH FIX HERE)
         combined_text = ""
         for t in threads:
-            combined_text += f"\nSOURCE URL: {t['url']}\nTITLE: {t['title']}\nCONTENT: {t['raw_content'][:1500]}\n{'='*20}\n"
+            # SAFETY CHECK: If raw_content is None, use empty string
+            content = t.get('raw_content') or "" 
+            url = t.get('url', 'No URL')
+            title = t.get('title', 'No Title')
+            
+            combined_text += f"\nSOURCE URL: {url}\nTITLE: {title}\nCONTENT: {content[:1500]}\n{'='*20}\n"
 
         # 4. ANALYZE (Gemini)
         status_box.write("🧠 Reading threads and extracting insights...")
@@ -91,29 +104,33 @@ if st.button("🚀 Find & Analyze Threads", type="primary"):
         """
         
         response = model.generate_content(prompt)
+        
+        # Clean up JSON (remove ```json wrappers)
         cleaned_json = re.sub(r"```json|```", "", response.text).strip()
-        data = json.loads(cleaned_json)
+        
+        # Parse JSON
+        try:
+            data = json.loads(cleaned_json)
+        except json.JSONDecodeError:
+            # Fallback if AI returns bad JSON
+            data = {"summary": "Error parsing AI response", "sentiment": "Error", "price_range": "N/A", "pain_points": [], "key_quote": "N/A"}
         
         status_box.update(label="✅ Analysis Complete!", state="complete", expanded=False)
 
         # 5. DISPLAY RESULTS
         st.divider()
         col1, col2 = st.columns(2)
-        col1.metric("Sentiment", data.get("sentiment"))
-        col2.metric("Price Est.", data.get("price_range"))
+        col1.metric("Sentiment", data.get("sentiment", "N/A"))
+        col2.metric("Price Est.", data.get("price_range", "N/A"))
         
         st.subheader("📝 Summary")
-        st.write(data.get("summary"))
+        st.write(data.get("summary", "No summary available."))
         
         st.subheader("😤 Top Pain Points")
         for p in data.get("pain_points", []):
             st.warning(f"• {p}")
             
-        st.info(f"**📢 Top Quote:** \"{data.get('key_quote')}\"")
-        
-        with st.expander("See Sources"):
-            for t in threads:
-                st.write(f"- [{t['title']}]({t['url']})")
+        st.info(f"**📢 Top Quote:** \"{data.get('key_quote', 'No quote found')}\"")
 
     except Exception as e:
         status_box.update(label="❌ Error", state="error")
