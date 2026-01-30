@@ -52,7 +52,7 @@ def run_analysis(topic, gemini_k, tavily_k, jina_k):
         # Init Clients
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
-        model = genai.GenerativeModel('gemini-2.0-flash') # Or 'gemini-1.5-flash' if 2.0 fails
+        model = genai.GenerativeModel('gemini-2.5-flash') # Or 'gemini-1.5-flash' if 2.0 fails
 
         # 1. Search
         log.append(f"🕵️ Searching Reddit for '{topic}'...")
