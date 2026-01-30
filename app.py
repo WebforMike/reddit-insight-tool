@@ -1,103 +1,102 @@
 import streamlit as st
 import google.generativeai as genai
 from tavily import TavilyClient
-import requests
 import json
 import re
 import os
-import statistics
 import time
+import pandas as pd # New: For real data analysis
 
-# --- 1. PAGE CONFIGURATION ---
-st.set_page_config(page_title="Reddit Insight Miner", page_icon="🛡️", layout="wide")
+# --- CONFIG ---
+st.set_page_config(page_title="Deep Reddit Analyst", page_icon="📊", layout="wide")
 
-# --- 2. SESSION STATE ---
 if "results" not in st.session_state:
     st.session_state.results = None
-if "status_log" not in st.session_state:
-    st.session_state.status_log = ""
 
-# --- 3. SIDEBAR: API KEYS ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("🔑 API Keys")
-    
-    gemini_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not gemini_key:
-        gemini_key = st.text_input("Gemini API Key", type="password")
+    gemini_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or st.text_input("Gemini Key", type="password")
+    tavily_key = st.secrets.get("TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY") or st.text_input("Tavily Key", type="password")
 
-    tavily_key = st.secrets.get("TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY")
-    if not tavily_key:
-        tavily_key = st.text_input("Tavily API Key", type="password")
-
-    # Jina is removed because it is getting blocked.
-    
-# --- 4. LOGIC: TAVILY CACHE MODE ---
-def run_analysis_cached(topic, gemini_k, tavily_k):
+# --- LOGIC ---
+def run_deep_analysis(topic, gemini_k, tavily_k):
     log = []
+    
     try:
         tavily = TavilyClient(api_key=tavily_k)
         genai.configure(api_key=gemini_k)
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        # Using Gemini 1.5 Pro or 2.0 Flash because we need a HUGE context window for this
+        model = genai.GenerativeModel('gemini-2.5-flash') 
 
-        # 1. SEARCH WITH RAW CONTENT (The Fix)
-        # We assume Reddit will block any direct visit, so we ask Tavily 
-        # to give us the 'raw_content' it scraped during indexing.
-        log.append(f"🕵️ Searching Reddit cache for '{topic}'...")
+        # 1. MULTI-QUERY EXPANSION (The "Quantity" Fix)
+        # We generate 3 variations of the search to find MORE threads.
+        queries = [
+            f"site:reddit.com {topic} price cost",
+            f"site:reddit.com {topic} quote received",
+            f"site:reddit.com {topic} review expensive cheap"
+        ]
         
-        search_result = tavily.search(
-            query=f"site:reddit.com {topic}", 
-            search_depth="advanced", 
-            max_results=5, 
-            include_raw_content=True # <--- CRITICAL: Get text immediately
-        )
+        all_threads = {} # Use dict to remove duplicates by URL
         
-        threads = search_result.get('results', [])
+        progress_bar = st.progress(0)
         
-        if not threads:
-            return None, log + ["❌ No threads found."]
+        for i, q in enumerate(queries):
+            log.append(f"🕵️ Running Query {i+1}: '{q}'...")
+            
+            # Use 'raw_content' to bypass blocking
+            response = tavily.search(query=q, search_depth="advanced", max_results=7, include_raw_content=True)
+            
+            for item in response.get('results', []):
+                # Only keep if it has decent text content
+                content = item.get('raw_content') or item.get('content')
+                if content and len(content) > 150:
+                    all_threads[item['url']] = {
+                        "title": item['title'],
+                        "url": item['url'],
+                        "content": content
+                    }
+            
+            time.sleep(0.5) # Be polite
+            progress_bar.progress((i + 1) / len(queries))
+            
+        unique_threads = list(all_threads.values())
+        
+        if len(unique_threads) < 2:
+            return None, log + ["❌ Not enough data found."]
+            
+        log.append(f"✅ Aggregated {len(unique_threads)} unique threads. Analyzing...")
 
-        # 2. COMPILE TEXT
+        # 2. BULK CONTEXT PREPARATION
+        # We combine ALL 15-20 threads into one massive prompt
         combined_text = ""
-        valid_count = 0
-        
-        for t in threads:
-            # We prioritize 'raw_content' (Full page cache).
-            # If that fails, we use 'content' (Snippet).
-            # We DO NOT visit the URL (avoids 403 Forbidden).
-            
-            source_text = t.get('raw_content')
-            source_type = "Full Cache"
-            
-            if not source_text or len(source_text) < 100:
-                source_text = t.get('content')
-                source_type = "Snippet"
-            
-            if source_text:
-                combined_text += f"SOURCE: {t['url']}\nTYPE: {source_type}\nCONTENT:\n{source_text[:6000]}\n{'='*40}\n"
-                valid_count += 1
-                log.append(f"✅ Loaded {source_type}: {t['title'][:30]}...")
-            else:
-                log.append(f"⚠️ Skipped {t['title'][:30]} (No text)")
-            
-        if valid_count == 0:
-            return None, log + ["❌ Tavily found links but no text data attached."]
+        for t in unique_threads:
+            combined_text += f"SOURCE: {t['url']}\nTITLE: {t['title']}\nCONTENT:\n{t['content'][:8000]}\n{'='*40}\n"
 
-        # 3. ANALYZE
-        log.append("🧠 Analyzing cached data with Gemini...")
-        
+        # 3. STRUCTURED EXTRACTION (The "Quality" Fix)
+        # We ask for a JSON List of Objects, not just numbers.
         prompt = f"""
-        Analyze these Reddit threads about "{topic}".
+        You are a Data Scientist. I have scraped {len(unique_threads)} Reddit threads about "{topic}".
         
-        Goal: Extract specific prices. 
-        Note: Data may be messy/raw. Do your best to find numbers.
+        Your Goal: Build a structured dataset of every specific price mention.
         
-        Return JSON ONLY:
-        - "raw_prices": [list of integers].
-        - "sentiment": "Positive/Negative/Neutral".
-        - "summary": String.
-        - "currency": "$".
-        - "key_quote": String.
+        Instructions:
+        1. Identify every user who mentioned a price they pay or were quoted.
+        2. Extract the specific "Insurer/Brand" if mentioned (e.g., Geico, Progressive). If unknown, use "Unknown".
+        3. Extract the "Context" (e.g., "23M, clean record", "2015 Honda", "Full coverage").
+        4. Extract the "Price" converted to a MONTHLY integer (e.g. $600/6-months -> 100).
+        5. Extract the "Sentiment" of that specific user (Positive/Negative/Neutral).
 
+        Return JSON ONLY with this structure:
+        {{
+            "dataset": [
+                {{ "insurer": "Geico", "price_monthly": 150, "context": "2020 Civic, 25yo male", "sentiment": "Positive", "source_title": "..." }},
+                ...
+            ],
+            "summary": "Overall market summary...",
+            "key_insight": "The most important takeaway..."
+        }}
+        
         DATA:
         {combined_text}
         """
@@ -105,66 +104,78 @@ def run_analysis_cached(topic, gemini_k, tavily_k):
         response = model.generate_content(prompt)
         cleaned_json = re.sub(r"```json|```", "", response.text).strip()
         data = json.loads(cleaned_json)
-        data["sources"] = threads
         
-        return data, log + ["✅ Analysis Complete!"]
+        return data, log + ["✅ Deep Analysis Complete!"]
 
     except Exception as e:
         return None, log + [f"❌ Error: {str(e)}"]
 
-# --- 5. MAIN UI ---
-st.title("🛡️ Reddit Insight Tool")
-st.markdown("Uses **Tavily's Cached Data** to bypass Reddit's firewalls completely.")
+# --- MAIN UI ---
+st.title("📊 Deep Reddit Analyst")
+st.markdown("Aggregates data from multiple searches to build a **Price vs. Brand** dataset.")
 
 with st.form("search_form"):
     topic_input = st.text_input("Enter Topic:", "Car Insurance Cost Florida")
-    submitted = st.form_submit_button("🚀 Mine Insights", type="primary")
+    submitted = st.form_submit_button("🚀 Run Deep Analysis", type="primary")
 
 if submitted:
     if not (gemini_key and tavily_key):
-        st.error("⚠️ Please enter Gemini and Tavily keys.")
+        st.error("Missing Keys.")
     else:
-        with st.spinner("Mining data from search cache..."):
-            data, logs = run_analysis_cached(topic_input, gemini_key, tavily_key)
+        with st.spinner("Running multi-step research..."):
+            data, logs = run_deep_analysis(topic_input, gemini_key, tavily_key)
             st.session_state.results = data
-            st.session_state.status_log = logs
+            
+            # Show logs in expader
+            with st.expander("Processing Logs"):
+                for l in logs: st.write(l)
 
-# --- 6. DISPLAY ---
+# --- DISPLAY RESULTS ---
 if st.session_state.results:
     data = st.session_state.results
+    rows = data.get("dataset", [])
     
-    # Math
-    raw_prices = data.get("raw_prices", [])
-    stats = {'min': 0, 'max': 0, 'avg': 0, 'median': 0, 'count': 0}
-    if raw_prices:
-        stats['min'] = min(raw_prices)
-        stats['max'] = max(raw_prices)
-        stats['avg'] = int(statistics.mean(raw_prices))
-        stats['median'] = int(statistics.median(raw_prices))
-        stats['count'] = len(raw_prices)
+    if not rows:
+        st.warning("No specific price data points found in these threads.")
+    else:
+        # Convert to DataFrame for powerful display
+        df = pd.DataFrame(rows)
+        
+        st.divider()
+        st.header(f"Results for: {topic_input}")
+        
+        # 1. HIGH LEVEL STATS
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Data Points Found", len(df))
+        c2.metric("Average Price", f"${int(df['price_monthly'].mean())}/mo")
+        c3.metric("Median Price", f"${int(df['price_monthly'].median())}/mo")
+        
+        # 2. PRICE BY INSURER (The "Context" you wanted)
+        st.subheader("🏆 Price & Sentiment by Brand")
+        
+        if "insurer" in df.columns:
+            # Group by Insurer
+            grouped = df.groupby("insurer").agg({
+                "price_monthly": "mean",
+                "sentiment": lambda x: x.mode()[0] if not x.mode().empty else "Mixed",
+                "context": "count"
+            }).rename(columns={"context": "count", "price_monthly": "avg_price"}).sort_values("count", ascending=False)
+            
+            st.dataframe(grouped, use_container_width=True)
+            
+            # Simple Bar Chart
+            st.bar_chart(df.set_index("insurer")["price_monthly"])
 
-    st.divider()
-    st.header(f"📊 Report: {topic_input}")
-    
-    c1, c2, c3, c4 = st.columns(4)
-    currency = data.get("currency", "$")
-    c1.metric("Avg Price", f"{currency}{stats['avg']}")
-    c2.metric("Median Price", f"{currency}{stats['median']}")
-    c3.metric("Min Found", f"{currency}{stats['min']}")
-    c4.metric("Max Found", f"{currency}{stats['max']}")
-    
-    st.caption(f"Based on {stats['count']} data points.")
-    
-    st.subheader("📝 Summary")
-    st.write(data.get("summary"))
-    
-    st.info(f"**Sentiment:** {data.get('sentiment')} | **Key Quote:** \"{data.get('key_quote')}\"")
-    
-    with st.expander("View Raw Sources"):
-        for s in data.get("sources", []):
-            st.markdown(f"- [{s['title']}]({s['url']})")
+        # 3. DETAILED DATA TABLE (Transparency)
+        st.subheader("📝 Raw Data Extracted")
+        st.markdown("This is the exact data the AI found. You can sort by price.")
+        st.dataframe(
+            df[["insurer", "price_monthly", "context", "sentiment"]], 
+            use_container_width=True,
+            hide_index=True
+        )
 
-if st.session_state.status_log:
-    with st.expander("Processing Logs"):
-        for msg in st.session_state.status_log:
-            st.write(msg)
+        # 4. SUMMARY
+        st.subheader("💡 Analysis")
+        st.write(data.get("summary"))
+        st.info(f"**Key Insight:** {data.get('key_insight')}")
