@@ -113,7 +113,7 @@ def run_analysis_cached(topic, gemini_k, tavily_k):
         return None, log + [f"❌ Error: {str(e)}"]
 
 # --- 5. MAIN UI ---
-st.title("🛡️ Reddit Insight (Block-Proof)")
+st.title("🛡️ Reddit Insight Tool")
 st.markdown("Uses **Tavily's Cached Data** to bypass Reddit's firewalls completely.")
 
 with st.form("search_form"):
